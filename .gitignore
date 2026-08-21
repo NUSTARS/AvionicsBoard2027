@@ -1,55 +1,192 @@
-# Prerequisites
-*.d
+# ============================================================
+# Python
+# ============================================================
+
+# Byte-compiled / optimized Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+
+# ============================================================
+# C / C++
+# ============================================================
 
 # Object files
 *.o
-*.ko
 *.obj
-*.elf
+*.lo
 
-# Linker output
-*.ilk
-*.map
-*.exp
+# Dependency files
+*.d
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
 
-# Libraries
-*.lib
+# Static libraries
 *.a
+*.lib
 *.la
-*.lo
 
-# Shared objects (inc. Windows DLLs)
-*.dll
+# Shared libraries
 *.so
 *.so.*
 *.dylib
+*.dll
 
 # Executables
 *.exe
 *.out
 *.app
-*.i*86
-*.x86_64
-*.hex
 
-# Debug files
+# Debug / symbol files
 *.dSYM/
-*.su
-*.idb
 *.pdb
+*.idb
+*.ilk
+*.su
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Linker output
+*.map
+*.exp
 
-# debug information files
-*.dwo
+# Generated binaries
+*.elf
+*.hex
+*.bin
+
+
+# ============================================================
+# STM32CubeIDE / Eclipse
+# ============================================================
+
+# Build output
+Debug/
+Release/
+
+# Eclipse workspace metadata
+.metadata/
+
+# NOTE:
+# Keep these tracked:
+# .project
+# .cproject
+# .settings/
+# *.launch
+# *.ioc
+
+
+# ============================================================
+# STM32CubeMX / Simulink
+# ============================================================
+
+# Simulink autosave / cache
+*.asv
+*.autosave
+*.slxc
+slprj/
+
+# Simulink code generation
+*_ert_rtw/
+*_grt_rtw/
+*_rtw/
+codegen/
+
+# MATLAB generated / temporary files
+*.bak
+*.log
+*.mex*
+
+
+# ============================================================
+# PlatformIO
+# ============================================================
+
+# PlatformIO build directory
+.pio/
+
+# PlatformIO IDE metadata
+.piolibdeps/
+
+# PlatformIO compiled libraries
+.pio/libdeps/
+
+# PlatformIO test results
+.pio/test/
+
+# PlatformIO configuration
+# KEEP platformio.ini TRACKED
+
+
+# ============================================================
+# IDEs / Editors
+# ============================================================
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# JetBrains
+.idea/
+
+# Vim
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+
+# ============================================================
+# General temporary files
+# ============================================================
+
+*.tmp
+*.temp
+*.swp
+*~
