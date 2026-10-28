@@ -1,0 +1,4 @@
+# Relink firmware when the generated model library changes.
+AUTOCODE_LIB_CM7 := ../../../../ActiveAero2027/STM32AutocodeLib/CM7/Debug/libautocodeLib_CM7.a
+
+AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: $(AUTOCODE_LIB_CM7)

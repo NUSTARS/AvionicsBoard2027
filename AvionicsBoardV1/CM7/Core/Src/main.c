@@ -751,6 +751,11 @@ Error_Handler();
   HAL_GPIO_WritePin(GNSS_NRST_GPIO_Port, GNSS_NRST_Pin, GPIO_PIN_SET);
 
 
+  /*
+   * Diagram mapping: autocodeModel contains Navigation, Guidance and Controller;
+   * autocodePlant contains Plant and SensorPlant. Plant sensor_bus feeds the
+   * next model step, and model control_deg drives the next plant step.
+   */
   autocodePlant_setup();
   autocodeModel_setup(&simulated_sensor_bus);
   RT_MODEL *model_rt = autocodeModel_getModel();
@@ -841,7 +846,7 @@ Error_Handler();
                          &simulated_navigation_bus,
                          &simulated_controller_bus,
                          simulated_control_deg);
-      /* Model outputs use the t sensor sample; plant truth is at t + dt. */
+      /* EOM states are at t + dt; plant derivatives and model outputs are at t. */
       SimulationLog_WriteRow(simulation_time_s - SIMULATION_STEP_PERIOD_S,
                              simulation_time_s);
       if (simulation_step_count >= SIMULATION_DURATION_STEPS)
