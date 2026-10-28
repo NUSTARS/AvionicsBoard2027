@@ -24,11 +24,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include "lsm6dso_app.h"
-#include "bmp5_app.h"
 #include <math.h>
 #include "usbd_cdc_if.h"
-#include "autocode_runner.h"
+#include "autocodeModel_initialize.h"
+#include "autocodePlant_initialize.h"
+/* USB device handle is defined in usb_device.c. */
+extern USBD_HandleTypeDef hUsbDeviceFS;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +55,12 @@
 #define NAV_PVT_SIZE 100
 #define UBX_MAX_PAYLOAD 256
 #define USBBUF_MAXLEN 128
+#define SIMULATION_STEP_PERIOD_US 10000U
+#define SIMULATION_STEP_PERIOD_S 0.01
+#define SIMULATION_LOG_SYNC_ROWS 100U
+#define SIMULATION_DURATION_SECONDS 30U
+#define SIMULATION_DURATION_STEPS \
+    ((SIMULATION_DURATION_SECONDS * 1000000U) / SIMULATION_STEP_PERIOD_US)
 
 /* USER CODE END PD */
 
@@ -158,18 +165,20 @@ uint8_t disable_nmea[] = {
 // -----------------------------------
 // DATA STRUCT
 // -----------------------------------
-FlightData_t flight_data;
-
-// -----------------------------------
-// FATFS
-// -----------------------------------
-UINT bytes_written;
-UINT bytes_read;
-
-uint32_t packet_counter = 0;
-
-const char *flight_filename = "flight.bin";
+/* USER CODE BEGIN PV */
+static sensor_bus simulated_sensor_bus;
+static navigation_bus simulated_navigation_bus;
+static controller_bus simulated_controller_bus;
+static plant_bus simulated_plant_bus;
+static real_T simulated_control_deg[4];
+static real_T simulation_time_s;
+static uint8_t simulation_log_active;
+static uint32_t simulation_log_rows_since_sync;
+static char simulation_log_line[768];
+static uint8_t simulation_start_message_pending;
+static uint8_t simulation_finish_message_pending;
 /* USER CODE END PV */
+
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -184,58 +193,23 @@ static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_TIM5_Init(void);
 /* USER CODE BEGIN PFP */
-static void ubx_checksum(uint8_t *msg, uint16_t len,
-                         uint8_t *cka, uint8_t *ckb)
-{
-    uint8_t a = 0;
-    uint8_t b = 0;
+//static void ubx_checksum(uint8_t *msg, uint16_t len,
+//                         uint8_t *cka, uint8_t *ckb)
+//{
+//    uint8_t a = 0;
+//    uint8_t b = 0;
+//
+//    // Start at CLASS, skip B5 62
+//    for (uint16_t i = 2; i < len; i++)
+//    {
+//        a += msg[i];
+//        b += a;
+//    }
+//
+//    *cka = a;
+//    *ckb = b;
+//}
 
-    // Start at CLASS, skip B5 62
-    for (uint16_t i = 2; i < len; i++)
-    {
-        a += msg[i];
-        b += a;
-    }
-
-    *cka = a;
-    *ckb = b;
-}
-
-void GNSS_PrintRaw(uint32_t timeout_ms)
-{
-    uint8_t byte;
-    uint32_t start = HAL_GetTick();
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "GNSS RX:\r\n");
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-    {
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-    }
-
-    while ((HAL_GetTick() - start) < timeout_ms)
-    {
-        if (HAL_UART_Receive(&huart2, &byte, 1, 10) == HAL_OK)
-        {
-            usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                                   "%02X ", byte);
-
-            if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-            {
-                CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-            }
-        }
-    }
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "\r\n--- END RX ---\r\n");
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-    {
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-    }
-}
 
 //void GNSS_PrintRaw(uint32_t timeout_ms)
 //{
@@ -337,57 +311,6 @@ void ParseNAVPVT(void)
     memcpy(&velD_raw,        &ubx_payload[56], 4);
     memcpy(&groundSpeed_raw, &ubx_payload[60], 4);
 
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "\r\n===== NAV-PVT =====\r\n");
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Time: %04u-%02u-%02u %02u:%02u:%02u\r\n",
-                           year, month, day, hour, minute, second);
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Fix Type: %u\r\nSatellites: %u\r\n",
-                           fixType, numSV);
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Latitude:  %.7f deg\r\n"
-                           "Longitude: %.7f deg\r\n",
-                           latitude_raw / 10000000.0,
-                           longitude_raw / 10000000.0);
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Altitude: %.3f m\r\n"
-                           "MSL Alt: %.3f m\r\n",
-                           height_raw / 1000.0,
-                           heightMSL_raw / 1000.0);
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Vel N: %.3f m/s\r\n"
-                           "Vel E: %.3f m/s\r\n"
-                           "Vel D: %.3f m/s\r\n"
-                           "Ground Speed: %.3f m/s\r\n"
-                           "===================\r\n",
-                           velN_raw / 1000.0,
-                           velE_raw / 1000.0,
-                           velD_raw / 1000.0,
-                           groundSpeed_raw / 1000.0);
-
-    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
 }
 
 //HAL_StatusTypeDef GNSS_PollNAVPVT(void)
@@ -539,10 +462,8 @@ HAL_StatusTypeDef GNSS_PollNAVPVT(void)
 //    return ch;
 //}
 
-uint8_t usbTxBuf[USBBUF_MAXLEN];
 uint8_t usbRxBuf[USBBUF_MAXLEN];
 
-uint16_t usbTxBufLen = 0;
 uint16_t usbRxBufLen = 0;
 
 uint8_t  usbRxFlag 	 = 0;
@@ -554,6 +475,182 @@ void USB_RXCallback(uint8_t* Buf, uint32_t *Len) {
 	usbRxFlag = 1;
 
 }
+
+
+static void SimulationLog_Stop(void)
+{
+    if (simulation_log_active != 0U)
+    {
+        (void)f_close(&SDFile);
+        simulation_log_active = 0U;
+    }
+}
+
+static void SimulationLog_Close(void)
+{
+    if (simulation_log_active == 0U)
+    {
+        return;
+    }
+
+    FRESULT result = f_sync(&SDFile);
+    if (result != FR_OK)
+    {
+        SimulationLog_Stop();
+        return;
+    }
+
+    (void)f_close(&SDFile);
+    simulation_log_active = 0U;
+}
+
+static uint8_t SimulationLog_Write(const void *data, UINT length)
+{
+    UINT bytes_written = 0U;
+    const FRESULT result = f_write(&SDFile, data, length, &bytes_written);
+    if (result != FR_OK || bytes_written != length)
+    {
+        SimulationLog_Stop();
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static uint8_t SimulationLog_Open(void)
+{
+    FRESULT result = f_mount(&SDFatFS, SDPath, 1U);
+    if (result != FR_OK)
+    {
+        return 0U;
+    }
+
+    char log_path[32];
+    const int path_len = snprintf(log_path, sizeof(log_path),
+                                  "%s/SIMSTATE.CSV", SDPath);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(log_path))
+    {
+        return 0U;
+    }
+
+    result = f_open(&SDFile, log_path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (result != FR_OK)
+    {
+        return 0U;
+    }
+
+    simulation_log_active = 1U;
+    static const char header[] =
+        "model_sample_time_s,plant_state_time_s,pos_n_m,pos_e_m,pos_d_m,q0,q1,q2,q3,"
+        "vel_body_x_mps,vel_body_y_mps,vel_body_z_mps,"
+        "rate_body_x_rps,rate_body_y_rps,rate_body_z_rps,"
+        "acc_body_x_mps2,acc_body_y_mps2,acc_body_z_mps2,"
+        "wdot_body_x_rps2,wdot_body_y_rps2,wdot_body_z_rps2,"
+        "nav_phi_rad,nav_theta_rad,nav_psi_rad,"
+        "control_0_deg,control_1_deg,control_2_deg,control_3_deg\r\n";
+    if (SimulationLog_Write(header, (UINT)(sizeof(header) - 1U)) == 0U)
+    {
+        return 0U;
+    }
+
+    result = f_sync(&SDFile);
+    if (result != FR_OK)
+    {
+        SimulationLog_Stop();
+        return 0U;
+    }
+
+    simulation_log_rows_since_sync = 0U;
+    return 1U;
+}
+
+static void SimulationLog_WriteRow(real_T model_sample_time_s,
+                                   real_T plant_state_time_s)
+{
+    if (simulation_log_active == 0U)
+    {
+        return;
+    }
+
+    const eom_bus *state = &simulated_plant_bus.eom_bus;
+    const int line_len = snprintf(
+        simulation_log_line, sizeof(simulation_log_line),
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\r\n",
+        model_sample_time_s, plant_state_time_s,
+        state->posNed_m[0], state->posNed_m[1], state->posNed_m[2],
+        state->q_na[0], state->q_na[1], state->q_na[2], state->q_na[3],
+        state->velBdy_mps[0], state->velBdy_mps[1], state->velBdy_mps[2],
+        state->wBdy_rps[0], state->wBdy_rps[1], state->wBdy_rps[2],
+        state->accBdy_mps2[0], state->accBdy_mps2[1], state->accBdy_mps2[2],
+        state->wDotBdy_rps2[0], state->wDotBdy_rps2[1],
+        state->wDotBdy_rps2[2],
+        simulated_navigation_bus.phiEst_rad,
+        simulated_navigation_bus.thetaEst_rad,
+        simulated_navigation_bus.psiEst_rad,
+        simulated_control_deg[0], simulated_control_deg[1],
+        simulated_control_deg[2], simulated_control_deg[3]);
+    if (line_len <= 0 || (size_t)line_len >= sizeof(simulation_log_line))
+    {
+        SimulationLog_Stop();
+        return;
+    }
+
+    if (SimulationLog_Write(simulation_log_line, (UINT)line_len) == 0U)
+    {
+        return;
+    }
+
+    simulation_log_rows_since_sync++;
+    if (simulation_log_rows_since_sync >= SIMULATION_LOG_SYNC_ROWS)
+    {
+        const FRESULT result = f_sync(&SDFile);
+        if (result != FR_OK)
+        {
+            SimulationLog_Stop();
+            return;
+        }
+
+        simulation_log_rows_since_sync = 0U;
+    }
+}
+
+static uint8_t SimulationCom_TryTransmit(const uint8_t *message,
+                                         uint16_t length)
+{
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
+        hUsbDeviceFS.pClassData == NULL ||
+        ((USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData)->TxState != 0U)
+    {
+        return 0U;
+    }
+
+    return (CDC_Transmit_FS((uint8_t *)message, length) == USBD_OK) ? 1U : 0U;
+}
+
+static void SimulationCom_ProcessPending(void)
+{
+    static const uint8_t start_message[] = "Simulation started\r\n";
+    static const uint8_t finish_message[] = "Simulation finished\r\n";
+
+    if (simulation_start_message_pending != 0U &&
+        SimulationCom_TryTransmit(start_message,
+                                  (uint16_t)(sizeof(start_message) - 1U)) != 0U)
+    {
+        simulation_start_message_pending = 0U;
+    }
+
+    if (simulation_start_message_pending == 0U &&
+        simulation_finish_message_pending != 0U &&
+        SimulationCom_TryTransmit(finish_message,
+                                  (uint16_t)(sizeof(finish_message) - 1U)) != 0U)
+    {
+        simulation_finish_message_pending = 0U;
+    }
+}
+
 
 /* USER CODE END 0 */
 
@@ -634,6 +731,7 @@ Error_Handler();
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
   MX_TIM5_Init();
+  (void)SimulationLog_Open();
   /* USER CODE BEGIN 2 */
 //  printf("\n================================\r\n");
 //  printf("CODE STARTING BEEP BOOP\n");
@@ -653,79 +751,20 @@ Error_Handler();
   HAL_GPIO_WritePin(GNSS_NRST_GPIO_Port, GNSS_NRST_Pin, GPIO_PIN_SET);
 
 
-  FRESULT fres;
+  autocodePlant_setup();
+  autocodeModel_setup(&simulated_sensor_bus);
+  RT_MODEL *model_rt = autocodeModel_getModel();
+  RT_MODEL_autocodePlant_T *plant_rt = autocodePlant_getModel();
 
-
-  fres = f_mount(&SDFatFS, SDPath, 1);
-
-  if (fres != FR_OK)
-  {
-      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                             "SD f_mount failed: %d\r\n", fres);
-  }
-  else
-  {
-      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                             "SD mounted successfully\r\n");
-  }
-
-  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-  {
-      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-  }
-
-  fres = f_open(&SDFile,
-                "flight.bin",
-                FA_WRITE | FA_CREATE_ALWAYS);
-
-  if (fres != FR_OK)
-  {
-      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                             "SD f_open failed: %d\r\n", fres);
-  }
-  else
-  {
-      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                             "Flight file opened successfully\r\n");
-  }
-
-  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-  {
-      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-  }
-
-
-//  if (fres != FR_OK)
-//  {
-//      printf("SD f_mount failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      printf("SD mounted successfully\r\n");
-//  }
-//
-//  fres = f_open(&SDFile,
-//                "flight.bin",
-//                FA_WRITE | FA_CREATE_ALWAYS);
-//
-//  if (fres != FR_OK)
-//  {
-//      printf("SD f_open failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      printf("Flight file opened successfully\r\n");
-//  }
-
-  if (LSM6DSO_App_Init() != LSM6DSO_OK)
-  {
-//	  printf("failed init LSM6DSO\r\n"); // Initialization failed
-  }
-//  if (BMP5_App_Init() != BMP5_APP_OK)
-//  {
-//	  printf("Failed init BMP585\r\n"); // Initialization failed
-//  }
-
+  /* Seed the model input from the plant's first simulated output. */
+  autocodePlant_step(plant_rt, simulated_control_deg,
+                     &simulated_sensor_bus, &simulated_plant_bus);
+  uint32_t simulation_step_count = 1U;
+  simulation_time_s =
+      (real_T)simulation_step_count * SIMULATION_STEP_PERIOD_S;
+  simulation_start_message_pending = 1U;
+  uint32_t next_simulation_step_us =
+      __HAL_TIM_GET_COUNTER(&htim5) + SIMULATION_STEP_PERIOD_US;
 //  uint8_t rx;
 //  uint8_t state = 0;
 //
@@ -782,7 +821,7 @@ Error_Handler();
 //
 //  GNSS_PrintRaw(3000);
 
-//  Autocode_Init();
+
 
   /* USER CODE END 2 */
 
@@ -790,51 +829,39 @@ Error_Handler();
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-//	  LSM6DSO_App_Process(&flight_data);
-//      Autocode_Run100Hz(&flight_data);
-//      const navigation_bus *nav = Autocode_GetNavigation();
-//
-//      const char *modeStr;
-//
-//      switch (nav->flightMode_enum)
-//      {
-//          case IDLE:
-//              modeStr = "IDLE";
-//              break;
-//
-//          case BOOST:
-//              modeStr = "BOOST";
-//              break;
-//
-//          case ACTIVE:
-//              modeStr = "ACTIVE";
-//              break;
-//
-//          case LOCKOUT:
-//              modeStr = "LOCKOUT";
-//              break;
-//
-//          default:
-//              modeStr = "UNKNOWN";
-//              break;
-//      }
-//      uint32_t period_us = Autocode_GetPeriodUs();
-//
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//          "MODE: %s | Period: %.3f ms | EULER: Phi=%.4f rad | Theta=%.4f rad | Psi=%.4f rad\r\n",
-//          modeStr,
-//          period_us / 1000.0f,
-//          nav->phiEst_rad,
-//          nav->thetaEst_rad,
-//          nav->psiEst_rad);
-//
-//      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//      {
-//    	  CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//      }
+      const uint32_t step_start_us = __HAL_TIM_GET_COUNTER(&htim5);
+      if ((int32_t)(step_start_us - next_simulation_step_us) < 0)
+      {
+          HAL_Delay(1);
+          continue;
+      }
+      SimulationCom_ProcessPending();
+
+      autocodeModel_step(model_rt, &simulated_sensor_bus,
+                         &simulated_navigation_bus,
+                         &simulated_controller_bus,
+                         simulated_control_deg);
+      /* Model outputs use the t sensor sample; plant truth is at t + dt. */
+      SimulationLog_WriteRow(simulation_time_s - SIMULATION_STEP_PERIOD_S,
+                             simulation_time_s);
+      if (simulation_step_count >= SIMULATION_DURATION_STEPS)
+      {
+          SimulationLog_Close();
+          simulation_finish_message_pending = 1U;
+          while (1)
+          {
+              SimulationCom_ProcessPending();
+              HAL_Delay(10);
+          }
+      }
+      autocodePlant_step(plant_rt, simulated_control_deg,
+                         &simulated_sensor_bus, &simulated_plant_bus);
+      simulation_step_count++;
+      simulation_time_s =
+          (real_T)simulation_step_count * SIMULATION_STEP_PERIOD_S;
 
 
-      LSM6DSO_App_Process(&flight_data);
+      //LSM6DSO_App_Process(&flight_data);
 
 //	  printf("ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
 //			  "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
@@ -845,20 +872,20 @@ Error_Handler();
 //			  flight_data.lsm_gyro.y,
 //			  flight_data.lsm_gyro.z);
 
-	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-	      "ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
-	      "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
-	      flight_data.lsm_accel.x,
-	      flight_data.lsm_accel.y,
-	      flight_data.lsm_accel.z,
-	      flight_data.lsm_gyro.x,
-	      flight_data.lsm_gyro.y,
-	      flight_data.lsm_gyro.z);
-
-	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-	  {
-	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-	  }
+//	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//	      "ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
+//	      "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
+//	      flight_data.lsm_accel.x,
+//	      flight_data.lsm_accel.y,
+//	      flight_data.lsm_accel.z,
+//	      flight_data.lsm_gyro.x,
+//	      flight_data.lsm_gyro.y,
+//	      flight_data.lsm_gyro.z);
+//
+//	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//	  {
+//	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//	  }
 
 //	  BMP585_App_Process(&flight_data);
 //
@@ -931,98 +958,7 @@ Error_Handler();
 //	  }
 //
 //	  ParseNAVPVT();
-
-	  flight_data.timestamp_us = __HAL_TIM_GET_COUNTER(&htim5);
-	  flight_data.packet_counter = packet_counter++;
-	  bytes_written = 0;
-
-	  fres = f_write(&SDFile,
-			  &flight_data,
-			  sizeof(FlightData_t),
-			  &bytes_written);
-
-	  if (fres != FR_OK || bytes_written != sizeof(FlightData_t))
-	  {
-	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-	                             "SD write failed: %d, wrote %u bytes\r\n",
-	                             fres,
-	                             (unsigned)bytes_written);
-
-	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-	  }
-
-	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-	                         "sizeof FlightData_t = %u, bytes_written = %u\r\n",
-	                         (unsigned)sizeof(FlightData_t),
-	                         (unsigned)bytes_written);
-
-	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-
-	  fres = f_sync(&SDFile);
-
-	  if (fres != FR_OK)
-	  {
-	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-	                             "Sync failed: %d\r\n", fres);
-
-	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-	  }
-
-	  if (packet_counter >= 100)
-	  {
-	      f_close(&SDFile);
-
-	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-	                             "Logging finished.\r\n"
-	                             "Expected file size: %lu\r\n"
-	                             "packet_counter = %lu\r\n"
-	                             "bytes_written = %u\r\n",
-	                             (unsigned long)(packet_counter * sizeof(FlightData_t)),
-	                             (unsigned long)packet_counter,
-	                             (unsigned)bytes_written);
-
-	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-	      {
-	    	  while (CDC_Transmit_FS(usbTxBuf, usbTxBufLen) == USBD_BUSY)
-	    	  {
-	    		  HAL_Delay(1);
-	    	  }
-	      }
-	      while (1);
-	  }
-
-//	  if (fres != FR_OK || bytes_written != sizeof(FlightData_t))
-//	  {
-//		  printf("SD write failed: %d, wrote %u bytes\r\n",
-//				  fres,
-//				  bytes_written);
-//	  }
 //
-//	  printf("sizeof FlightData_t = %u, bytes_written = %u\r\n",
-//	         (unsigned)sizeof(FlightData_t),
-//	         (unsigned)bytes_written);
-//
-//	  fres = f_sync(&SDFile);
-//
-//	  if (fres != FR_OK) {
-//		  printf("Sync failed: %d\r\n", fres);
-//	  }
-//
-//	  if (packet_counter >= 6000) {
-//		  f_close(&SDFile);
-//		  printf("Logging finished.\r\n");
-//		  printf("Expected file size: %lu\r\n",
-//		         (unsigned long)(packet_counter * sizeof(FlightData_t)));
-//		  printf("packet_counter = %lu\r\n",
-//		         (unsigned long)packet_counter);
-//
-//		  printf("bytes_written = %u\r\n",
-//		         (unsigned)bytes_written);
-//		  while (1);
-//	  }
 
 //	  if (GNSS_PollNAVPVT() == HAL_OK)
 //	  {
@@ -1030,7 +966,12 @@ Error_Handler();
 //	  }
 
 
-	  HAL_Delay(50);
+      next_simulation_step_us += SIMULATION_STEP_PERIOD_US;
+      const uint32_t step_finish_us = __HAL_TIM_GET_COUNTER(&htim5);
+      if ((int32_t)(step_finish_us - next_simulation_step_us) >= 0)
+      {
+          next_simulation_step_us = step_finish_us + SIMULATION_STEP_PERIOD_US;
+      }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

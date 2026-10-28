@@ -1,5 +1,6 @@
 #include "main.h"
 #include "autocode_runner.h"
+#include "autocodeModel_initialize.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -7,9 +8,7 @@
 extern TIM_HandleTypeDef htim5;
 
 /* Generated model data */
-static RT_MODEL rtM_;
-static RT_MODEL *const rtM = &rtM_;
-static DW rtDW;
+static RT_MODEL *rtM;
 
 static sensor_bus rtU_sensor_bus_e;
 static navigation_bus rtY_navigation_bus_d;
@@ -37,8 +36,6 @@ static bool model_initialized = false;
 /*
  * Copy only the LSM6DSO fields into the generated sensor bus.
  *
- * Fill this in after checking the sensor_bus definition
- * in autocodeModel.h.
  */
 static void MapFlightDataToSensorBus(
     const FlightData_t *flight_data, sensor_bus *sensorBus)
@@ -68,17 +65,10 @@ void Autocode_Init(void)
         rtY_control_deg[i] = 0.0;
     }
 
-    /* Connect generated model state */
-    rtM->dwork = &rtDW;
 
-    /* Initialize the model */
-    autocodeModel_initialize(
-        rtM,
-        &rtU_sensor_bus_e,
-        &rtY_navigation_bus_d,
-        &rtY_controller_bus_f,
-        rtY_control_deg
-    );
+    /* Initialize the model using the current generated wrapper API. */
+    autocodeModel_setup(&rtU_sensor_bus_e);
+    rtM = autocodeModel_getModel();
 
     /*
      * TIM5 must be configured for a 1 MHz counter,
