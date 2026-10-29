@@ -18,18 +18,19 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "fatfs.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 #include "usbd_cdc_if.h"
+#include "usbd_def.h"
+extern USBD_HandleTypeDef hUsbDeviceFS;
 #include "autocodeModel_initialize.h"
 #include "autocodePlant_initialize.h"
-/* USB device handle is defined in usb_device.c. */
-extern USBD_HandleTypeDef hUsbDeviceFS;
+#include "autocodePlant_feedback.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,7 +45,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /*                             demonstration code based on hardware semaphore */
 /* This define is present in both CM7/CM4 projects                            */
 /* To comment when developping/debugging on a single core                     */
-//#define DUAL_CORE_BOOT_SYNC_SEQUENCE
+#undef DUAL_CORE_BOOT_SYNC_SEQUENCE /* Standalone CM7: CM4 is disabled. */
 
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
 #ifndef HSEM_ID_0
@@ -57,10 +58,19 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define USBBUF_MAXLEN 128
 #define SIMULATION_STEP_PERIOD_US 10000U
 #define SIMULATION_STEP_PERIOD_S 0.01
-#define SIMULATION_LOG_SYNC_ROWS 100U
-#define SIMULATION_DURATION_SECONDS 30U
+#define SIMULATION_DURATION_SECONDS 35U
 #define SIMULATION_DURATION_STEPS \
-    ((SIMULATION_DURATION_SECONDS * 1000000U) / SIMULATION_STEP_PERIOD_US)
+    (((SIMULATION_DURATION_SECONDS * 1000000U) / SIMULATION_STEP_PERIOD_US) + 1U)
+#define SIMULATION_LOG_FRAME_BUFFER_SIZE 800U
+#define SIMULATION_LOG_COMMAND_BUFFER_SIZE 32U
+#define SIMULATION_LOG_MAX_ATTEMPTS 3U
+#define SIMULATION_LOG_ACK_TIMEOUT_MS 3000U
+#define SIMULATION_LOG_UART_TIMEOUT_MS 1000U
+#define SIMULATION_LOG_ACK_LINE_LENGTH 12U
+#define SIMULATION_START_COMMAND "START_LOG_SIM"
+#define SIMULATION_ECHO_COMMAND "ECHO"
+#define SIMULATION_LOG_ACK_ACCEPTED 1U
+#define SIMULATION_LOG_ACK_RETRY 2U
 
 /* USER CODE END PD */
 
@@ -171,12 +181,39 @@ static navigation_bus simulated_navigation_bus;
 static controller_bus simulated_controller_bus;
 static plant_bus simulated_plant_bus;
 static real_T simulated_control_deg[4];
-static real_T simulation_time_s;
-static uint8_t simulation_log_active;
-static uint32_t simulation_log_rows_since_sync;
+/* Capture in SRAM; UART at 115200 cannot carry 28 CSV columns at 100 Hz.
+ * Float storage uses 364104 bytes; generated calculations remain real_T. */
+static float simulation_samples[SIMULATION_DURATION_STEPS][26];
+static uint32_t simulation_sample_count;
+static uint32_t simulation_next_step_us;
+static RT_MODEL *simulation_model;
+static RT_MODEL_autocodePlant_T *simulation_plant;
+volatile uint32_t simulation_deadline_misses;
+volatile uint32_t simulation_step_max_us;
+static uint32_t simulation_start_us;
+static uint32_t simulation_next_ready_ms;
+static uint32_t simulation_transfer_row;
+static uint8_t simulation_phase;
+static uint8_t simulation_frame_pending;
+static uint8_t simulation_waiting_ack;
+static uint8_t simulation_attempts;
+static uint32_t simulation_ack_tick;
+static uint16_t simulation_tx_length;
+static uint16_t simulation_tx_offset;
+static uint8_t simulation_transport_usb;
+static uint8_t simulation_usb_tx_started;
+static volatile uint16_t simulation_usb_rx_head;
+static volatile uint16_t simulation_usb_rx_tail;
+static uint8_t simulation_usb_rx[256];
+static uint32_t simulation_tx_tick;
+static char simulation_command[SIMULATION_LOG_COMMAND_BUFFER_SIZE];
+static uint16_t simulation_command_length;
+static uint8_t simulation_command_overflow;
+enum { SIM_READY, SIM_RUNNING, SIM_HEADER, SIM_ROWS, SIM_END, SIM_DONE, SIM_ERROR };
 static char simulation_log_line[768];
-static uint8_t simulation_start_message_pending;
-static uint8_t simulation_finish_message_pending;
+static char simulation_log_frame[SIMULATION_LOG_FRAME_BUFFER_SIZE];
+static uint32_t simulation_log_next_sequence;
+static uint32_t simulation_log_rows_sent;
 /* USER CODE END PV */
 
 
@@ -186,7 +223,6 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
@@ -468,78 +504,125 @@ uint16_t usbRxBufLen = 0;
 
 uint8_t  usbRxFlag 	 = 0;
 
-void USB_RXCallback(uint8_t* Buf, uint32_t *Len) {
-
-	memcpy(usbRxBuf, Buf, *Len);
-	usbRxBufLen = *Len;
-	usbRxFlag = 1;
-
+/* USB IRQ producer / main-loop consumer. Never parse commands in the ISR. */
+void USB_RXCallback(uint8_t* Buf, uint32_t *Len)
+{
+    for (uint32_t i = 0; i < *Len; ++i)
+    {
+        uint16_t next = (simulation_usb_rx_head + 1U) % sizeof(simulation_usb_rx);
+        if (next == simulation_usb_rx_tail) break;
+        simulation_usb_rx[simulation_usb_rx_head] = Buf[i];
+        __DMB();
+        simulation_usb_rx_head = next;
+    }
 }
 
 
-static void SimulationLog_Stop(void)
+
+/* UART is polled one byte per loop: no HAL_MAX_DELAY, RX wait, or IRQ dependency.
+ * The shared TX buffer is owned until TC, including the final stop bit. */
+static uint8_t SimulationCom_Queue(const char *text)
 {
-    if (simulation_log_active != 0U)
-    {
-        (void)f_close(&SDFile);
-        simulation_log_active = 0U;
-    }
-}
-
-static void SimulationLog_Close(void)
-{
-    if (simulation_log_active == 0U)
-    {
-        return;
-    }
-
-    FRESULT result = f_sync(&SDFile);
-    if (result != FR_OK)
-    {
-        SimulationLog_Stop();
-        return;
-    }
-
-    (void)f_close(&SDFile);
-    simulation_log_active = 0U;
-}
-
-static uint8_t SimulationLog_Write(const void *data, UINT length)
-{
-    UINT bytes_written = 0U;
-    const FRESULT result = f_write(&SDFile, data, length, &bytes_written);
-    if (result != FR_OK || bytes_written != length)
-    {
-        SimulationLog_Stop();
-        return 0U;
-    }
-
+    if (simulation_tx_length != 0U) return 0U;
+    size_t length = strlen(text);
+    if (length == 0U || length >= sizeof(simulation_log_frame)) return 0U;
+    if (text != simulation_log_frame) memcpy(simulation_log_frame, text, length);
+    simulation_tx_length = (uint16_t)length;
+    simulation_tx_offset = 0U;
+    simulation_usb_tx_started = 0U;
+    simulation_tx_tick = HAL_GetTick();
     return 1U;
 }
 
-static uint8_t SimulationLog_Open(void)
+static void SimulationLog_Abort(const char *reason)
 {
-    FRESULT result = f_mount(&SDFatFS, SDPath, 1U);
-    if (result != FR_OK)
+    simulation_phase = SIM_ERROR;
+    simulation_frame_pending = 0U;
+    simulation_waiting_ack = 0U;
+    simulation_tx_length = 0U;
+    snprintf(simulation_log_line, sizeof(simulation_log_line), "ERR,%s\r\n", reason);
+    (void)SimulationCom_Queue(simulation_log_line);
+}
+
+static uint16_t SimulationLog_Crc16Update(uint16_t crc, uint8_t value)
+{
+    crc ^= (uint16_t)value << 8;
+    for (uint8_t bit = 0U; bit < 8U; bit++)
+    {
+        crc = ((crc & 0x8000U) != 0U)
+                  ? (uint16_t)((crc << 1) ^ 0x1021U)
+                  : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+static uint8_t SimulationLog_ParseAck(const char *line,
+                                      uint32_t expected_sequence)
+{
+    if (strlen(line) != SIMULATION_LOG_ACK_LINE_LENGTH)
     {
         return 0U;
     }
 
-    char log_path[32];
-    const int path_len = snprintf(log_path, sizeof(log_path),
-                                  "%s/SIMSTATE.CSV", SDPath);
-    if (path_len <= 0 || (size_t)path_len >= sizeof(log_path))
+    uint8_t result = 0U;
+    if (strncmp(line, "ACK,", 4U) == 0)
+    {
+        result = SIMULATION_LOG_ACK_ACCEPTED;
+    }
+    else if (strncmp(line, "NAK,", 4U) == 0)
+    {
+        result = SIMULATION_LOG_ACK_RETRY;
+    }
+    else
     {
         return 0U;
     }
 
-    result = f_open(&SDFile, log_path, FA_WRITE | FA_CREATE_ALWAYS);
-    if (result != FR_OK)
+    uint32_t received_sequence = 0U;
+    for (uint8_t digit_index = 0U; digit_index < 8U; digit_index++)
     {
-        return 0U;
+        const char digit = line[4U + digit_index];
+        uint8_t value;
+        if (digit >= '0' && digit <= '9')
+        {
+            value = (uint8_t)(digit - '0');
+        }
+        else if (digit >= 'A' && digit <= 'F')
+        {
+            value = (uint8_t)(digit - 'A' + 10);
+        }
+        else if (digit >= 'a' && digit <= 'f')
+        {
+            value = (uint8_t)(digit - 'a' + 10);
+        }
+        else
+        {
+            return 0U;
+        }
+        received_sequence = (received_sequence << 4) | value;
     }
 
-    simulation_log_active = 1U;
+    return (received_sequence == expected_sequence) ? result : 0U;
+}
+
+
+static uint8_t SimulationLog_SendFrame(uint32_t sequence, const char *payload)
+{
+    int length = snprintf(simulation_log_frame, sizeof(simulation_log_frame),
+                          "@%08lX|%s", (unsigned long)sequence, payload);
+    if (length <= 0 || (size_t)length + 8U >= sizeof(simulation_log_frame)) return 0U;
+    uint16_t crc = 0xFFFFU;
+    for (int i = 1; i < length; ++i)
+        crc = SimulationLog_Crc16Update(crc, (uint8_t)simulation_log_frame[i]);
+    snprintf(&simulation_log_frame[length], sizeof(simulation_log_frame) - (size_t)length,
+             "|%04X\r\n", (unsigned int)crc);
+    simulation_frame_pending = 1U;
+    simulation_attempts = 1U;
+    return SimulationCom_Queue(simulation_log_frame);
+}
+
+static uint8_t SimulationLog_SendHeader(void)
+{
     static const char header[] =
         "model_sample_time_s,plant_state_time_s,pos_n_m,pos_e_m,pos_d_m,q0,q1,q2,q3,"
         "vel_body_x_mps,vel_body_y_mps,vel_body_z_mps,"
@@ -547,110 +630,272 @@ static uint8_t SimulationLog_Open(void)
         "acc_body_x_mps2,acc_body_y_mps2,acc_body_z_mps2,"
         "wdot_body_x_rps2,wdot_body_y_rps2,wdot_body_z_rps2,"
         "nav_phi_rad,nav_theta_rad,nav_psi_rad,"
-        "control_0_deg,control_1_deg,control_2_deg,control_3_deg\r\n";
-    if (SimulationLog_Write(header, (UINT)(sizeof(header) - 1U)) == 0U)
-    {
-        return 0U;
-    }
+        "control_0_deg,control_1_deg,control_2_deg,control_3_deg";
 
-    result = f_sync(&SDFile);
-    if (result != FR_OK)
-    {
-        SimulationLog_Stop();
-        return 0U;
-    }
 
-    simulation_log_rows_since_sync = 0U;
-    return 1U;
+    return SimulationLog_SendFrame(0U, header);
 }
 
-static void SimulationLog_WriteRow(real_T model_sample_time_s,
-                                   real_T plant_state_time_s)
+static uint8_t SimulationLog_WriteRow(uint32_t row)
 {
-    if (simulation_log_active == 0U)
+    int length = snprintf(simulation_log_line, sizeof(simulation_log_line),
+                          "%.6f,%.6f", row * SIMULATION_STEP_PERIOD_S,
+                          row * SIMULATION_STEP_PERIOD_S);
+    for (uint32_t i = 0U; i < 26U; ++i)
     {
-        return;
+        if (length <= 0 || (size_t)length >= sizeof(simulation_log_line)) return 0U;
+        int added = snprintf(&simulation_log_line[length],
+                             sizeof(simulation_log_line) - (size_t)length,
+                             ",%.6f", (double)simulation_samples[row][i]);
+        if (added <= 0 || (size_t)added >= sizeof(simulation_log_line) - (size_t)length)
+            return 0U;
+        length += added;
     }
+    return SimulationLog_SendFrame(simulation_log_next_sequence, simulation_log_line);
+}
 
-    const eom_bus *state = &simulated_plant_bus.eom_bus;
-    const int line_len = snprintf(
-        simulation_log_line, sizeof(simulation_log_line),
-        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-        "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\r\n",
-        model_sample_time_s, plant_state_time_s,
-        state->posNed_m[0], state->posNed_m[1], state->posNed_m[2],
-        state->q_na[0], state->q_na[1], state->q_na[2], state->q_na[3],
-        state->velBdy_mps[0], state->velBdy_mps[1], state->velBdy_mps[2],
-        state->wBdy_rps[0], state->wBdy_rps[1], state->wBdy_rps[2],
-        state->accBdy_mps2[0], state->accBdy_mps2[1], state->accBdy_mps2[2],
-        state->wDotBdy_rps2[0], state->wDotBdy_rps2[1],
-        state->wDotBdy_rps2[2],
-        simulated_navigation_bus.phiEst_rad,
-        simulated_navigation_bus.thetaEst_rad,
-        simulated_navigation_bus.psiEst_rad,
-        simulated_control_deg[0], simulated_control_deg[1],
-        simulated_control_deg[2], simulated_control_deg[3]);
-    if (line_len <= 0 || (size_t)line_len >= sizeof(simulation_log_line))
-    {
-        SimulationLog_Stop();
-        return;
-    }
+static void SimulationLog_CaptureRow(void)
+{
+    const eom_bus *e = &simulated_plant_bus.eom_bus;
+    float *row = simulation_samples[simulation_sample_count];
+    uint32_t column = 0U;
+    for (uint32_t i = 0; i < 3; ++i) row[column++] = (float)e->posNed_m[i];
+    for (uint32_t i = 0; i < 4; ++i) row[column++] = (float)e->q_na[i];
+    for (uint32_t i = 0; i < 3; ++i) row[column++] = (float)e->velBdy_mps[i];
+    for (uint32_t i = 0; i < 3; ++i) row[column++] = (float)e->wBdy_rps[i];
+    for (uint32_t i = 0; i < 3; ++i) row[column++] = (float)e->accBdy_mps2[i];
+    for (uint32_t i = 0; i < 3; ++i) row[column++] = (float)e->wDotBdy_rps2[i];
+    row[column++] = (float)simulated_navigation_bus.phiEst_rad;
+    row[column++] = (float)simulated_navigation_bus.thetaEst_rad;
+    row[column++] = (float)simulated_navigation_bus.psiEst_rad;
+    for (uint32_t i = 0; i < 4; ++i) row[column++] = (float)simulated_control_deg[i];
+}
 
-    if (SimulationLog_Write(simulation_log_line, (UINT)line_len) == 0U)
-    {
-        return;
-    }
+/* The plant invokes this at its major output/update boundary: sensors and
+ * truth are at t; the controller updates u(t) before actuator/discrete updates
+ * and integration. A final sample at 35.00 s returns without advancing time. */
+static boolean_T Simulation_RunController(sensor_bus *sensors, plant_bus *plant,
+                                           real_T control_deg[4])
+{
+    (void)plant; /* Both bus pointers refer to the application's live buses. */
+    autocodeModel_step(simulation_model, sensors,
+                       &simulated_navigation_bus, &simulated_controller_bus,
+                       control_deg);
+    SimulationLog_CaptureRow();
+    return simulation_sample_count + 1U < SIMULATION_DURATION_STEPS;
+}
 
-    simulation_log_rows_since_sync++;
-    if (simulation_log_rows_since_sync >= SIMULATION_LOG_SYNC_ROWS)
+static void Simulation_Start(void)
+{
+    memset(&simulated_sensor_bus, 0, sizeof(simulated_sensor_bus));
+    memset(simulated_control_deg, 0, sizeof(simulated_control_deg));
+    autocodePlant_setup();
+    autocodeModel_setup(&simulated_sensor_bus);
+    simulation_model = autocodeModel_getModel();
+    simulation_plant = autocodePlant_getModel();
+    autocodePlant_SetFeedbackCallback(Simulation_RunController);
+    simulation_sample_count = 0U;
+    simulation_deadline_misses = 0U;
+    simulation_step_max_us = 0U;
+    simulation_start_us = __HAL_TIM_GET_COUNTER(&htim5);
+    simulation_next_step_us = simulation_start_us;
+    simulation_phase = SIM_RUNNING;
+}
+
+static void SimulationCom_OnLine(const char *line)
+{
+    if (simulation_waiting_ack != 0U)
     {
-        const FRESULT result = f_sync(&SDFile);
-        if (result != FR_OK)
+        uint8_t ack = SimulationLog_ParseAck(line, simulation_log_next_sequence);
+        if (ack == SIMULATION_LOG_ACK_RETRY)
         {
-            SimulationLog_Stop();
+            /* Service loop handles retransmission without waiting. */
+            simulation_ack_tick = HAL_GetTick() - SIMULATION_LOG_ACK_TIMEOUT_MS;
+        }
+        else if (ack == SIMULATION_LOG_ACK_ACCEPTED)
+        {
+            simulation_waiting_ack = 0U;
+            simulation_frame_pending = 0U;
+            simulation_log_next_sequence++;
+            if (simulation_phase == SIM_HEADER) simulation_phase = SIM_ROWS;
+            else if (simulation_phase == SIM_ROWS)
+            {
+                simulation_transfer_row++;
+                simulation_log_rows_sent++;
+                if (simulation_transfer_row == SIMULATION_DURATION_STEPS) simulation_phase = SIM_END;
+            }
+            else if (simulation_phase == SIM_END) simulation_phase = SIM_DONE;
+        }
+        return;
+    }
+    if (simulation_phase != SIM_READY || simulation_tx_length != 0U) return;
+    if (strcmp(line, SIMULATION_ECHO_COMMAND) == 0)
+        (void)SimulationCom_Queue("ECHO_OK\r\n");
+    else if (strcmp(line, SIMULATION_START_COMMAND) == 0)
+    {
+        (void)SimulationCom_Queue("STARTED\r\n");
+        Simulation_Start();
+    }
+    else (void)SimulationCom_Queue("ERR,UNKNOWN_COMMAND\r\n");
+}
+
+static void SimulationCom_ReceiveByte(uint8_t byte, uint8_t from_usb)
+{
+    /* A host owns the link from its command through DONE. */
+    if (simulation_phase != SIM_READY && from_usb != simulation_transport_usb) return;
+    if (byte == '\n')
+    {
+        simulation_command[simulation_command_length] = '\0';
+        if (!simulation_command_overflow && simulation_command_length)
+        {
+            if (simulation_phase == SIM_READY) simulation_transport_usb = from_usb;
+            SimulationCom_OnLine(simulation_command);
+        }
+        simulation_command_length = 0U;
+        simulation_command_overflow = 0U;
+    }
+    else if (byte != '\r')
+    {
+        if (simulation_command_length < sizeof(simulation_command) - 1U)
+            simulation_command[simulation_command_length++] = (char)byte;
+        else simulation_command_overflow = 1U;
+    }
+}
+
+static void SimulationCom_Service(void)
+{
+    uint32_t now = HAL_GetTick();
+    /* Clear line errors, including ORE after a disconnected host. */
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_ORE)) __HAL_UART_CLEAR_OREFLAG(&huart3);
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_FE)) __HAL_UART_CLEAR_FEFLAG(&huart3);
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_NE)) __HAL_UART_CLEAR_NEFLAG(&huart3);
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE))
+        SimulationCom_ReceiveByte((uint8_t)huart3.Instance->RDR, 0U);
+    if (simulation_usb_rx_tail != simulation_usb_rx_head)
+    {
+        uint8_t byte = simulation_usb_rx[simulation_usb_rx_tail];
+        simulation_usb_rx_tail = (simulation_usb_rx_tail + 1U) % sizeof(simulation_usb_rx);
+        SimulationCom_ReceiveByte(byte, 1U);
+    }
+    if (simulation_tx_length != 0U)
+    {
+        uint8_t complete = 0U;
+        if (simulation_transport_usb)
+        {
+            USBD_CDC_HandleTypeDef *cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+            if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED && cdc != NULL)
+            {
+                if (!simulation_usb_tx_started && cdc->TxState == 0U &&
+                    CDC_Transmit_FS((uint8_t *)simulation_log_frame, simulation_tx_length) == USBD_OK)
+                    simulation_usb_tx_started = 1U;
+                else if (simulation_usb_tx_started && cdc->TxState == 0U) complete = 1U;
+            }
+        }
+        else
+        {
+        if (simulation_tx_offset < simulation_tx_length)
+        {
+            if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TXE))
+                huart3.Instance->TDR = (uint8_t)simulation_log_frame[simulation_tx_offset++];
+        }
+        else if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TC)) complete = 1U;
+        }
+        if (complete)
+        {
+            simulation_tx_length = 0U;
+            if (simulation_frame_pending)
+            {
+                simulation_waiting_ack = 1U;
+                simulation_ack_tick = now;
+            }
+        }
+        if (simulation_tx_length && simulation_phase != SIM_READY && simulation_phase != SIM_ERROR &&
+            (uint32_t)(now - simulation_tx_tick) >= SIMULATION_LOG_UART_TIMEOUT_MS)
+            SimulationLog_Abort("UART_TX_TIMEOUT");
+        return;
+    }
+    if (simulation_waiting_ack)
+    {
+        if ((uint32_t)(now - simulation_ack_tick) >= SIMULATION_LOG_ACK_TIMEOUT_MS)
+        {
+            if (simulation_attempts >= SIMULATION_LOG_MAX_ATTEMPTS)
+                SimulationLog_Abort("ACK_TIMEOUT");
+            else
+            {
+                simulation_attempts++;
+                simulation_waiting_ack = 0U;
+                (void)SimulationCom_Queue(simulation_log_frame);
+            }
+        }
+        return;
+    }
+    if (simulation_phase == SIM_READY && (int32_t)(now - simulation_next_ready_ms) >= 0)
+    {
+        /* Prefer the enumerated board USB COM port; UART remains available. */
+        simulation_transport_usb = (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED);
+        (void)SimulationCom_Queue("READY\r\n");
+        simulation_next_ready_ms = now + 1000U;
+    }
+    else if (simulation_phase == SIM_HEADER)
+    {
+        if (!SimulationLog_SendHeader()) SimulationLog_Abort("HEADER_FORMAT_FAILED");
+    }
+    else if (simulation_phase == SIM_ROWS)
+    {
+        if (!SimulationLog_WriteRow(simulation_transfer_row)) SimulationLog_Abort("ROW_FORMAT_FAILED");
+    }
+    else if (simulation_phase == SIM_END)
+    {
+        snprintf(simulation_log_line, sizeof(simulation_log_line), "END,%lu", (unsigned long)simulation_log_rows_sent);
+        if (!SimulationLog_SendFrame(simulation_log_next_sequence, simulation_log_line)) SimulationLog_Abort("END_FORMAT_FAILED");
+    }
+    else if (simulation_phase == SIM_DONE)
+    {
+        snprintf(simulation_log_line, sizeof(simulation_log_line), "DONE,%lu\r\n", (unsigned long)simulation_log_rows_sent);
+        (void)SimulationCom_Queue(simulation_log_line);
+        simulation_phase = SIM_READY;
+        simulation_next_ready_ms = now + 1000U;
+    }
+}
+
+static void Simulation_Service(void)
+{
+    if (simulation_phase != SIM_RUNNING) return;
+    uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
+    if ((int32_t)(now - simulation_next_step_us) < 0) return;
+    /* Plant outputs -> controller -> plant state updates/integration, all in
+     * the same sample. Capture occurs in the callback before minor solver stages. */
+    if (simulation_sample_count < SIMULATION_DURATION_STEPS)
+    {
+        if (now - simulation_next_step_us >= SIMULATION_STEP_PERIOD_US)
+        {
+            simulation_deadline_misses++;
+            SimulationLog_Abort("SIMULATION_DEADLINE_MISSED");
             return;
         }
-
-        simulation_log_rows_since_sync = 0U;
+        autocodePlant_step(simulation_plant, simulated_control_deg,
+                           &simulated_sensor_bus, &simulated_plant_bus);
+        simulation_sample_count++;
+        uint32_t elapsed = __HAL_TIM_GET_COUNTER(&htim5) - now;
+        if (elapsed > simulation_step_max_us) simulation_step_max_us = elapsed;
+        if ((int32_t)(__HAL_TIM_GET_COUNTER(&htim5) - (simulation_next_step_us + SIMULATION_STEP_PERIOD_US)) >= 0)
+        {
+            simulation_deadline_misses++;
+            SimulationLog_Abort("SIMULATION_STEP_OVERRUN");
+            return;
+        }
+        if (simulation_sample_count < SIMULATION_DURATION_STEPS)
+            simulation_next_step_us += SIMULATION_STEP_PERIOD_US;
+    }
+    /* Keep the run phase alive to its 35 s boundary before starting UART output. */
+    else
+    {
+        simulation_log_next_sequence = 0U;
+        simulation_log_rows_sent = 0U;
+        simulation_transfer_row = 0U;
+        simulation_phase = SIM_HEADER;
     }
 }
-
-static uint8_t SimulationCom_TryTransmit(const uint8_t *message,
-                                         uint16_t length)
-{
-    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
-        hUsbDeviceFS.pClassData == NULL ||
-        ((USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData)->TxState != 0U)
-    {
-        return 0U;
-    }
-
-    return (CDC_Transmit_FS((uint8_t *)message, length) == USBD_OK) ? 1U : 0U;
-}
-
-static void SimulationCom_ProcessPending(void)
-{
-    static const uint8_t start_message[] = "Simulation started\r\n";
-    static const uint8_t finish_message[] = "Simulation finished\r\n";
-
-    if (simulation_start_message_pending != 0U &&
-        SimulationCom_TryTransmit(start_message,
-                                  (uint16_t)(sizeof(start_message) - 1U)) != 0U)
-    {
-        simulation_start_message_pending = 0U;
-    }
-
-    if (simulation_start_message_pending == 0U &&
-        simulation_finish_message_pending != 0U &&
-        SimulationCom_TryTransmit(finish_message,
-                                  (uint16_t)(sizeof(finish_message) - 1U)) != 0U)
-    {
-        simulation_finish_message_pending = 0U;
-    }
-}
-
 
 /* USER CODE END 0 */
 
@@ -672,6 +917,10 @@ int main(void)
 
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
+  /* Generated double-precision plant code needs M7 caches to meet 10 ms. USB
+   * uses CPU-driven FIFO transfers (PCD DMA disabled), so no DMA cache alias. */
+  SCB_EnableICache();
+  SCB_EnableDCache();
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
@@ -719,266 +968,22 @@ Error_Handler();
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
+  /* UART simulation needs no sensor, USB, SD, CAN or CM4 initialization. */
   MX_GPIO_Init();
-  MX_FDCAN2_Init();
-  MX_I2C1_Init();
-  MX_SDMMC1_SD_Init();
-  MX_SPI1_Init();
-  MX_TIM2_Init();
-  MX_USART2_UART_Init();
   MX_USART3_UART_Init();
-  MX_USB_DEVICE_Init();
-  MX_FATFS_Init();
   MX_TIM5_Init();
-  (void)SimulationLog_Open();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-//  printf("\n================================\r\n");
-//  printf("CODE STARTING BEEP BOOP\n");
-//  printf("================================\r\n");
-  HAL_Delay(5000);
-  HAL_TIM_Base_Start(&htim5);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(BMI_CSG_GPIO_Port, BMI_CSG_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, BMP585_CS_Pin|BMI_CSA_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_SET);
-
-  HAL_GPIO_WritePin(GNSS_NRST_GPIO_Port, GNSS_NRST_Pin, GPIO_PIN_SET);
-
-
-  /*
-   * Diagram mapping: autocodeModel contains Navigation, Guidance and Controller;
-   * autocodePlant contains Plant and SensorPlant. Plant sensor_bus feeds the
-   * next model step, and model control_deg drives the next plant step.
-   */
-  autocodePlant_setup();
-  autocodeModel_setup(&simulated_sensor_bus);
-  RT_MODEL *model_rt = autocodeModel_getModel();
-  RT_MODEL_autocodePlant_T *plant_rt = autocodePlant_getModel();
-
-  /* Seed the model input from the plant's first simulated output. */
-  autocodePlant_step(plant_rt, simulated_control_deg,
-                     &simulated_sensor_bus, &simulated_plant_bus);
-  uint32_t simulation_step_count = 1U;
-  simulation_time_s =
-      (real_T)simulation_step_count * SIMULATION_STEP_PERIOD_S;
-  simulation_start_message_pending = 1U;
-  uint32_t next_simulation_step_us =
-      __HAL_TIM_GET_COUNTER(&htim5) + SIMULATION_STEP_PERIOD_US;
-//  uint8_t rx;
-//  uint8_t state = 0;
-//
-//  uint8_t cka, ckb;
-//
-//  ubx_checksum(disable_nmea, sizeof(disable_nmea) - 2,
-//               &cka, &ckb);
-//
-//  disable_nmea[sizeof(disable_nmea) - 2] = cka;
-//  disable_nmea[sizeof(disable_nmea) - 1] = ckb;
-
-//  printf("CFG-VALSET packet:\r\n");
-//
-//  for (uint16_t i = 0; i < sizeof(disable_nmea); i++)
-//  {
-//      printf("%02X ", disable_nmea[i]);
-//  }
-//
-//  printf("\r\n");
-//
-//  printf("Sending CFG-VALSET...\r\n");
-//  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                         "CFG-VALSET packet:\r\n");
-//
-//  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//
-//  for (uint16_t i = 0; i < sizeof(disable_nmea); i++)
-//  {
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                             "%02X ", disable_nmea[i]);
-//
-//      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//  }
-//
-//  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                         "\r\nSending CFG-VALSET...\r\n");
-//
-//  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//
-//  while (HAL_UART_Receive(&huart2, &rx, 1, 0) == HAL_OK)
-//  {
-//      // Flush stale bytes
-//  }
-//
-//  HAL_StatusTypeDef status = HAL_UART_Transmit(
-//      &huart2,
-//      disable_nmea,
-//      sizeof(disable_nmea),
-//      1000
-//  );
-//
-//  GNSS_PrintRaw(3000);
-
-
-
+  if (HAL_TIM_Base_Start(&htim5) != HAL_OK) Error_Handler();
+  simulation_phase = SIM_READY;
+  simulation_next_ready_ms = HAL_GetTick();
   /* USER CODE END 2 */
-
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      const uint32_t step_start_us = __HAL_TIM_GET_COUNTER(&htim5);
-      if ((int32_t)(step_start_us - next_simulation_step_us) < 0)
-      {
-          HAL_Delay(1);
-          continue;
-      }
-      SimulationCom_ProcessPending();
-
-      autocodeModel_step(model_rt, &simulated_sensor_bus,
-                         &simulated_navigation_bus,
-                         &simulated_controller_bus,
-                         simulated_control_deg);
-      /* EOM states are at t + dt; plant derivatives and model outputs are at t. */
-      SimulationLog_WriteRow(simulation_time_s - SIMULATION_STEP_PERIOD_S,
-                             simulation_time_s);
-      if (simulation_step_count >= SIMULATION_DURATION_STEPS)
-      {
-          SimulationLog_Close();
-          simulation_finish_message_pending = 1U;
-          while (1)
-          {
-              SimulationCom_ProcessPending();
-              HAL_Delay(10);
-          }
-      }
-      autocodePlant_step(plant_rt, simulated_control_deg,
-                         &simulated_sensor_bus, &simulated_plant_bus);
-      simulation_step_count++;
-      simulation_time_s =
-          (real_T)simulation_step_count * SIMULATION_STEP_PERIOD_S;
-
-
-      //LSM6DSO_App_Process(&flight_data);
-
-//	  printf("ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
-//			  "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
-//			  flight_data.lsm_accel.x,
-//			  flight_data.lsm_accel.y,
-//			  flight_data.lsm_accel.z,
-//			  flight_data.lsm_gyro.x,
-//			  flight_data.lsm_gyro.y,
-//			  flight_data.lsm_gyro.z);
-
-//	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	      "ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
-//	      "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
-//	      flight_data.lsm_accel.x,
-//	      flight_data.lsm_accel.y,
-//	      flight_data.lsm_accel.z,
-//	      flight_data.lsm_gyro.x,
-//	      flight_data.lsm_gyro.y,
-//	      flight_data.lsm_gyro.z);
-//
-//	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	  {
-//	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//	  }
-
-//	  BMP585_App_Process(&flight_data);
-//
-//	  float altitude = 44330.0f *
-//	                   (1.0f - powf(flight_data.bmp585_pressure / 101325.0f, 0.1903f));
-//
-//	  float altitude_ft = altitude * 3.28084f;
-
-//	  printf("PRESSURE: %.2f hPa | TEMP: %.2f C | ALT: %.2f ft\r\n",
-//	         flight_data.bmp585_pressure / 100.0f,
-//	         flight_data.bmp585_temperature,
-//			 altitude_ft);
-
-
-//	  printf("NAV-PVT poll packet:\r\n");
-//
-//	  for (uint16_t i = 0; i < sizeof(nav_pvt_poll); i++)
-//	  {
-//		  printf("%02X ", nav_pvt_poll[i]);
-//	  }
-//
-//	  printf("\r\n");
-//
-//	  HAL_UART_Transmit(
-//			  &huart2,
-//			  nav_pvt_poll,
-//			  sizeof(nav_pvt_poll),
-//			  1000
-//	  );
-//
-//	  uint8_t nav_rx[128];
-//	  uint16_t nav_count = 0;
-//	  uint8_t byte;
-//
-//	  uint32_t start = HAL_GetTick();
-//
-//	  while ((HAL_GetTick() - start) < 3000)
-//	  {
-//		  if (HAL_UART_Receive(&huart2, &byte, 1, 10) == HAL_OK)
-//		  {
-//			  if (nav_count < sizeof(nav_rx))
-//			  {
-//				  nav_rx[nav_count++] = byte;
-//			  }
-//		  }
-//	  }
-//
-//	  printf("Received %u bytes:\r\n", nav_count);
-//
-//	  for (uint16_t i = 0; i < nav_count; i++)
-//	  {
-//		  printf("%02X ", nav_rx[i]);
-//	  }
-//
-//	  printf("\r\n");
-//
-//	  if (nav_count >= 100 &&
-//			  nav_rx[0] == 0xB5 &&
-//			  nav_rx[1] == 0x62 &&
-//			  nav_rx[2] == 0x01 &&
-//			  nav_rx[3] == 0x07)
-//	  {
-//		  printf("Valid NAV-PVT packet found!\r\n");
-//
-//		  memcpy(ubx_payload, &nav_rx[6], 92);
-//	  }
-//	  else
-//	  {
-//		  printf("NAV-PVT packet not found\r\n");
-//	  }
-//
-//	  ParseNAVPVT();
-//
-
-//	  if (GNSS_PollNAVPVT() == HAL_OK)
-//	  {
-//		  ParseNAVPVT();
-//	  }
-
-
-      next_simulation_step_us += SIMULATION_STEP_PERIOD_US;
-      const uint32_t step_finish_us = __HAL_TIM_GET_COUNTER(&htim5);
-      if ((int32_t)(step_finish_us - next_simulation_step_us) >= 0)
-      {
-          next_simulation_step_us = step_finish_us + SIMULATION_STEP_PERIOD_US;
-      }
+    Simulation_Service();
+    SimulationCom_Service();
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -995,25 +1000,31 @@ void SystemClock_Config(void)
 
   /** Supply configuration update enable
   */
-  HAL_PWREx_ConfigSupply(PWR_SMPS_2V5_SUPPLIES_LDO);
+  if (HAL_PWREx_ConfigSupply(PWR_SMPS_2V5_SUPPLIES_LDO) != HAL_OK) Error_Handler();
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+  const uint32_t voltage_start = HAL_GetTick();
+  while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY))
+  {
+    if ((uint32_t)(HAL_GetTick() - voltage_start) >= 100U) Error_Handler();
+  }
 
+  /* HSI / 8 * 60 = 480 MHz VCO; CPU 240 MHz, AHB 120 MHz, USB 48 MHz. */
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 5;
-  RCC_OscInitStruct.PLL.PLLN = 48;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 60;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 5;
+  RCC_OscInitStruct.PLL.PLLQ = 10;
   RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
@@ -1030,7 +1041,7 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
@@ -1043,7 +1054,7 @@ void SystemClock_Config(void)
 
   /** Enables the Clock Security System
   */
-  HAL_RCC_EnableCSS();
+  /* HSI: no external-clock security interrupt required. */
 }
 
 /**
@@ -1147,36 +1158,6 @@ static void MX_I2C1_Init(void)
 
 }
 
-/**
-  * @brief SDMMC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SDMMC1_SD_Init(void)
-{
-
-  /* USER CODE BEGIN SDMMC1_Init 0 */
-
-  /* USER CODE END SDMMC1_Init 0 */
-
-  /* USER CODE BEGIN SDMMC1_Init 1 */
-
-  /* USER CODE END SDMMC1_Init 1 */
-  hsd1.Instance = SDMMC1;
-  hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
-  hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
-  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
-  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 2;
-  if (HAL_SD_Init(&hsd1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SDMMC1_Init 2 */
-
-  /* USER CODE END SDMMC1_Init 2 */
-
-}
 
 /**
   * @brief SPI1 Initialization Function
@@ -1306,7 +1287,9 @@ static void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 59;
+  uint32_t timer_clock = HAL_RCC_GetPCLK1Freq();
+  if ((RCC->D2CFGR & RCC_D2CFGR_D2PPRE1) != 0U) timer_clock *= 2U;
+  htim5.Init.Prescaler = timer_clock / 1000000U - 1U;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 4294967295;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
