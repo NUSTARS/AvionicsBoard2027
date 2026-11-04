@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 void Autocode_Init(void);
+void Autocode_Step(const FlightData_t *flight_data);
 void Autocode_Run100Hz(const FlightData_t *flight_data);
 
 uint32_t Autocode_GetPeriodUs(void);

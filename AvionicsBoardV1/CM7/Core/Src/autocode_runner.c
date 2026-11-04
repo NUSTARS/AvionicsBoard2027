@@ -11,8 +11,8 @@ extern TIM_HandleTypeDef htim5;
 static RT_MODEL *rtM;
 
 static sensor_bus rtU_sensor_bus_e;
-static navigation_bus rtY_navigation_bus_d;
-static controller_bus rtY_controller_bus_f;
+static navigation_bus navBus;
+static controller_bus controllerBus;
 static real_T rtY_control_deg[4];
 
 /* 100 Hz = 10,000 us */
@@ -34,22 +34,14 @@ static bool model_initialized = false;
 
 
 /*
- * Copy only the LSM6DSO fields into the generated sensor bus.
+ * Map the live IMU and temporary 1000 Pa barometer into the sensor bus.
  *
  */
-static void MapFlightDataToSensorBus(
-    const FlightData_t *flight_data, sensor_bus *sensorBus)
+static void MapFlightDataToSensorBus(const FlightData_t *data, sensor_bus *bus)
 {
-    sensorBus->fBdyMeas_mps2[0] = flight_data->lsm_accel.x;
-    sensorBus->fBdyMeas_mps2[1] = flight_data->lsm_accel.y;
-    sensorBus->fBdyMeas_mps2[2] = flight_data->lsm_accel.z;
-
-    // Gyroscope: convert degrees/s to radians/s
-    const double DEG_TO_RAD = 0.017453292519943295;
-
-    sensorBus->wBdyMeas_rps[0] = flight_data->lsm_gyro.x * DEG_TO_RAD;
-    sensorBus->wBdyMeas_rps[1] = flight_data->lsm_gyro.y * DEG_TO_RAD;
-    sensorBus->wBdyMeas_rps[2] = flight_data->lsm_gyro.z * DEG_TO_RAD;
+    Vector3f_t accel __attribute__((aligned(8))) = data ? data->lsm_accel : (Vector3f_t){0};
+    Vector3f_t gyro __attribute__((aligned(8))) = data ? data->lsm_gyro : (Vector3f_t){0};
+    autocodeModel_initializeSensorBus(bus, &accel, &gyro, NULL, 1000.0);
 }
 
 
@@ -58,13 +50,15 @@ void Autocode_Init(void)
 {
     /* Zero the generated input and output structures */
     rtU_sensor_bus_e = (sensor_bus){0};
-    rtY_navigation_bus_d = (navigation_bus){0};
-    rtY_controller_bus_f = (controller_bus){0};
+    navBus = (navigation_bus){0};
+    controllerBus = (controller_bus){0};
 
     for (uint32_t i = 0; i < 4; i++) {
         rtY_control_deg[i] = 0.0;
     }
 
+
+    MapFlightDataToSensorBus(NULL, &rtU_sensor_bus_e);
 
     /* Initialize the model using the current generated wrapper API. */
     autocodeModel_setup(&rtU_sensor_bus_e);
@@ -130,34 +124,9 @@ void Autocode_Run100Hz(const FlightData_t *flight_data)
     }
 
     previous_model_start_us = now;
-    model_last_start_us = now;
 
-    /* Transfer current LSM6DSO measurements to the model. */
-    MapFlightDataToSensorBus(flight_data, &rtU_sensor_bus_e);
-
-    /* Execute one generated model step. */
-    autocodeModel_step(
-        rtM,
-        &rtU_sensor_bus_e,
-        &rtY_navigation_bus_d,
-        &rtY_controller_bus_f,
-        rtY_control_deg
-    );
-
-    uint32_t finish = __HAL_TIM_GET_COUNTER(&htim5);
-
-    model_last_finish_us = finish;
-    model_step_duration_us = finish - now;
-
-    if (model_step_duration_us > model_step_duration_max_us) {
-        model_step_duration_max_us = model_step_duration_us;
-    }
-
-    model_step_count++;
-
-    if (model_step_duration_us >= MODEL_PERIOD_US) {
-        model_deadline_miss_count++;
-    }
+    Autocode_Step(flight_data);
+    uint32_t finish = model_last_finish_us;
 
     /*
      * Advance the deadline by whole periods, avoiding drift
@@ -187,10 +156,45 @@ const real_T *Autocode_GetControlDeg(void)
 
 const navigation_bus *Autocode_GetNavigation(void)
 {
-    return &rtY_navigation_bus_d;
+    return &navBus;
 }
 
 const controller_bus *Autocode_GetController(void)
 {
-    return &rtY_controller_bus_f;
+    return &controllerBus;
+}
+
+void Autocode_Step(const FlightData_t *flight_data)
+{
+    if (!model_initialized || flight_data == NULL) return;
+    uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
+    if (model_step_count != 0U) model_period_actual_us = now - model_last_start_us;
+    model_last_start_us = now;
+    /* Transfer current LSM6DSO measurements to the model. */
+    MapFlightDataToSensorBus(flight_data, &rtU_sensor_bus_e);
+
+    /* Execute one generated model step. */
+    autocodeModel_step(
+        rtM,
+        &rtU_sensor_bus_e,
+        &navBus,
+        &controllerBus,
+        rtY_control_deg
+    );
+
+    uint32_t finish = __HAL_TIM_GET_COUNTER(&htim5);
+
+    model_last_finish_us = finish;
+    model_step_duration_us = finish - now;
+
+    if (model_step_duration_us > model_step_duration_max_us) {
+        model_step_duration_max_us = model_step_duration_us;
+    }
+
+    model_step_count++;
+
+    if (model_step_duration_us >= MODEL_PERIOD_US) {
+        model_deadline_miss_count++;
+    }
+
 }

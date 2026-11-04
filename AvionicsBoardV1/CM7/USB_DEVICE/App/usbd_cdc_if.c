@@ -30,6 +30,10 @@
 /* Private macro -------------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static volatile uint8_t cdc_port_open;
+static volatile uint32_t cdc_connection_epoch;
+uint8_t CDC_IsPortOpen_FS(void) { return cdc_port_open; }
+uint32_t CDC_ConnectionEpoch_FS(void) { return cdc_connection_epoch; }
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE END PV */
 
@@ -151,6 +155,7 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+  cdc_port_open = 0U;
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -165,6 +170,7 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  cdc_port_open = 0U;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -225,8 +231,14 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
     	break;
 
     case CDC_SET_CONTROL_LINE_STATE:
-
-    break;
+    {
+      /* For zero-length CDC requests the library passes the setup request. */
+      const USBD_SetupReqTypedef *request = (const USBD_SetupReqTypedef *)pbuf;
+      const uint8_t open = (request->wValue & 1U) ? 1U : 0U;
+      if (open && !cdc_port_open) cdc_connection_epoch++;
+      cdc_port_open = open;
+      break;
+    }
 
     case CDC_SEND_BREAK:
 

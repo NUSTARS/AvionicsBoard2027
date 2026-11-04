@@ -1,4 +1,21 @@
-# Relink firmware when the generated model library changes.
-AUTOCODE_LIB_CM7 := ../../../../ActiveAero2027/STM32AutocodeLib/CM7/Debug/libautocodeLib_CM7.a
+# Build only the autocodeModel export and its shared dependencies for CM7.
+# Keeping this override outside generated Debug/*.mk preserves it on IDE regen.
+MODEL_ROOT := ../../../../ActiveAero2027/STM32AutocodeLib/CM7
+MODEL_EXPORT_SRC := ../../../../ActiveAero2027/activeControlSim/build_autocodeModel/toIDE/Src
+MODEL_NAMES := $(notdir $(wildcard $(MODEL_EXPORT_SRC)/*.c))
+MODEL_OBJS := $(patsubst %.c,modelonly_%.o,$(MODEL_NAMES))
+MODEL_HEADERS := $(wildcard $(MODEL_ROOT)/Inc/*.h)
+LIBS := -L. -lautocodeModel_CM7
 
-AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: $(AUTOCODE_LIB_CM7)
+modelonly_%.o: $(MODEL_ROOT)/Src/%.c $(MODEL_HEADERS) ../makefile.targets
+	arm-none-eabi-gcc "$<" -mcpu=cortex-m7 -std=gnu11 -g3 -c -I"$(MODEL_ROOT)/Inc" -O2 -ffunction-sections -fdata-sections -Wall -MMD -MP -MF"$(@:%.o=%.d)" -MT"$@" --specs=nano.specs -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb -o "$@"
+
+libautocodeModel_CM7.a: $(MODEL_OBJS) ../makefile.targets
+	arm-none-eabi-ar rcs "$@" $(MODEL_OBJS)
+
+AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: libautocodeModel_CM7.a
+-include $(MODEL_OBJS:.o=.d)
+
+# Recompile consumers whenever the generated model archive changes, including
+# copies whose preserved source timestamps predate existing firmware objects.
+Core/Src/main.o Core/Src/autocode_runner.o: libautocodeModel_CM7.a

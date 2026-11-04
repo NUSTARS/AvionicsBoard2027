@@ -22,15 +22,31 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#define ENABLE_UART_TELEMETRY_PACKETS 1 /* 1: nav packets on USART3 + COM4 USB; 0: status only. */
+#define ENABLE_SIMULATION_UART_LOG 0 /* Set to 1 only for the desktop-model test. */
 #include <stdio.h>
+#include <stddef.h>
+#include "fatfs.h"
+#include "lsm6dso_app.h"
+#include "bmp5_app.h"
+#include "autocode_runner.h"
+#include "GNSS.h"
+#if !ENABLE_SIMULATION_UART_LOG
+#include "flight_log_format.h"
+#if ENABLE_UART_TELEMETRY_PACKETS
+#include "uart_telemetry_format.h"
+#endif
+#endif
 #include <math.h>
 #include <string.h>
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
 extern USBD_HandleTypeDef hUsbDeviceFS;
+#if ENABLE_SIMULATION_UART_LOG
 #include "autocodeModel_initialize.h"
 #include "autocodePlant_initialize.h"
 #include "autocodePlant_feedback.h"
+#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -176,6 +192,7 @@ uint8_t disable_nmea[] = {
 // DATA STRUCT
 // -----------------------------------
 /* USER CODE BEGIN PV */
+#if ENABLE_SIMULATION_UART_LOG
 static sensor_bus simulated_sensor_bus;
 static navigation_bus simulated_navigation_bus;
 static controller_bus simulated_controller_bus;
@@ -214,6 +231,7 @@ static char simulation_log_line[768];
 static char simulation_log_frame[SIMULATION_LOG_FRAME_BUFFER_SIZE];
 static uint32_t simulation_log_next_sequence;
 static uint32_t simulation_log_rows_sent;
+#endif
 /* USER CODE END PV */
 
 
@@ -224,6 +242,7 @@ static void MX_GPIO_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_SDMMC1_SD_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
@@ -504,6 +523,7 @@ uint16_t usbRxBufLen = 0;
 
 uint8_t  usbRxFlag 	 = 0;
 
+#if ENABLE_SIMULATION_UART_LOG
 /* USB IRQ producer / main-loop consumer. Never parse commands in the ISR. */
 void USB_RXCallback(uint8_t* Buf, uint32_t *Len)
 {
@@ -897,6 +917,348 @@ static void Simulation_Service(void)
     }
 }
 
+#else
+/* Simulation streaming is disabled; USB commands do not start a model run. */
+void USB_RXCallback(uint8_t *Buf, uint32_t *Len) { (void)Buf; (void)Len; }
+#endif
+
+
+#if !ENABLE_SIMULATION_UART_LOG
+/* v2 file header describes the unchanged packed FlightData_t payload ABI. */
+_Static_assert(sizeof(FlightData_t) == 154U, "Legacy flight.bin record size changed");
+_Static_assert(offsetof(FlightData_t, lsm_accel) == 56U, "LSM field offset changed");
+_Static_assert(offsetof(FlightData_t, gnss_fix_type) == 152U, "GNSS field offset changed");
+static FlightData_t flight_data;
+static FlightLogRecord_t telemetry_record;
+static UBX_HandleTypeDef telemetry_gnss;
+static uint32_t telemetry_gps_last_ms;
+static uint32_t telemetry_gps_next_poll_ms;
+static uint8_t telemetry_gps_received;
+static uint8_t telemetry_gps_fix_valid;
+static uint8_t telemetry_header[FLIGHT_LOG_HEADER_SIZE];
+static uint8_t telemetry_packet[FLIGHT_LOG_PACKET_SIZE];
+static uint32_t telemetry_packet_counter;
+static uint32_t telemetry_next_sample_us;
+static uint32_t telemetry_last_sync_ms;
+static uint8_t telemetry_logging;
+static uint8_t telemetry_started;
+static uint8_t telemetry_sampling;
+static uint8_t telemetry_has_previous_packet;
+static uint32_t telemetry_previous_packet_us;
+static uint8_t telemetry_lockout_latched;
+static uint32_t telemetry_lockout_start_ms;
+#define TELEMETRY_LOCKOUT_TAIL_MS 120000U
+static uint8_t telemetry_uart_status_pending;
+static char telemetry_uart_status_tx[128];
+#if ENABLE_UART_TELEMETRY_PACKETS
+static uint8_t telemetry_uart_candidate[UART_TELEMETRY_PACKET_SIZE];
+static uint8_t telemetry_uart_packet_tx[UART_TELEMETRY_PACKET_SIZE];
+static uint8_t telemetry_usb_packet_tx[UART_TELEMETRY_PACKET_SIZE];
+volatile uint32_t telemetry_uart_dropped_packets;
+volatile uint32_t telemetry_usb_dropped_packets;
+#endif
+static char telemetry_filename[16];
+/* Stable buffer retained until USB has actually transmitted the boot status. */
+static char telemetry_status[128];
+static char telemetry_usb_status_tx[128];
+static uint8_t telemetry_usb_status_pending;
+static uint32_t telemetry_usb_connection_epoch;
+static uint32_t telemetry_usb_ready_after_ms;
+static void Telemetry_ServiceStatus(void);
+
+static void Telemetry_Status(const char *message)
+{
+    (void)snprintf(telemetry_status, sizeof(telemetry_status), "%s", message);
+    telemetry_uart_status_pending = 1U;
+    telemetry_usb_status_pending = 1U;
+    Telemetry_ServiceStatus();
+}
+
+static void Telemetry_ServiceStatus(void)
+{
+    /* Serialize ASCII status and binary frames; never overwrite active TX. */
+    if (telemetry_uart_status_pending && huart3.gState == HAL_UART_STATE_READY)
+    {
+        (void)snprintf(telemetry_uart_status_tx, sizeof(telemetry_uart_status_tx),
+                       "%s", telemetry_status);
+        if (HAL_UART_Transmit_IT(&huart3, (uint8_t *)telemetry_uart_status_tx,
+                                 (uint16_t)strlen(telemetry_uart_status_tx)) == HAL_OK)
+            telemetry_uart_status_pending = 0U;
+    }
+    /* Reopen/reconnect gets the latest outcome, even long after boot. */
+    if (!CDC_IsPortOpen_FS()) return;
+    uint32_t epoch = CDC_ConnectionEpoch_FS();
+    if (epoch != telemetry_usb_connection_epoch)
+    {
+        telemetry_usb_connection_epoch = epoch;
+        telemetry_usb_status_pending = 1U;
+        /* Windows terminals/pyserial purge input immediately after setting DTR. */
+        telemetry_usb_ready_after_ms = HAL_GetTick() + 300U;
+    }
+    if ((int32_t)(HAL_GetTick() - telemetry_usb_ready_after_ms) < 0) return;
+    USBD_CDC_HandleTypeDef *cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (!telemetry_usb_status_pending || telemetry_status[0] == '\0' ||
+        hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED || cdc == NULL ||
+        cdc->TxState != 0U) return;
+    /* Never mutate a buffer still owned by the USB endpoint. */
+    (void)snprintf(telemetry_usb_status_tx, sizeof(telemetry_usb_status_tx),
+                   "%s", telemetry_status);
+    if (CDC_Transmit_FS((uint8_t *)telemetry_usb_status_tx,
+                        (uint16_t)strlen(telemetry_usb_status_tx)) == USBD_OK)
+        telemetry_usb_status_pending = 0U;
+}
+
+static void Telemetry_StopOnError(const char *operation, FRESULT result)
+{
+    char message[128];
+    telemetry_logging = 0U;
+    (void)f_close(&SDFile);
+    (void)snprintf(message, sizeof(message), "SD %s failed: %u\r\n",
+                   operation, (unsigned int)result);
+    Telemetry_Status(message);
+}
+
+/* GPS receives bytes independently of SD latency. A NAV-PVT mailbox remains
+ * immutable until UBX_Update consumes it. Never wait for a satellite fix. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *uart)
+{
+    if (uart->Instance == USART2)
+        UBX_RxByteCallback(&telemetry_gnss, telemetry_gnss.rxByte);
+}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *uart)
+{
+    if (uart->Instance == USART2)
+    {
+        __HAL_UART_CLEAR_OREFLAG(uart);
+        (void)HAL_UART_Receive_IT(uart, &telemetry_gnss.rxByte, 1U);
+    }
+}
+static void Telemetry_ServiceGPS(void)
+{
+    UBX_Update(&telemetry_gnss);
+    if (telemetry_gnss.pvtUpdated)
+    {
+        const UBX_NAV_PVT_t *pvt = &telemetry_gnss.pvt;
+        flight_data.latitude = (double)pvt->lat * 1.0e-7;
+        flight_data.longitude = (double)pvt->lon * 1.0e-7;
+        flight_data.altitude = (float)pvt->height * 0.001f;
+        flight_data.velocity_north = (float)pvt->velN * 0.001f;
+        flight_data.velocity_east = (float)pvt->velE * 0.001f;
+        flight_data.velocity_down = (float)pvt->velD * 0.001f;
+        flight_data.gnss_fix_type = pvt->fixType;
+        flight_data.gnss_satellites = pvt->numSV;
+        telemetry_gps_fix_valid = ((pvt->flags & 1U) != 0U && pvt->fixType >= 2U);
+        telemetry_gps_received = 1U;
+        telemetry_gps_last_ms = HAL_GetTick();
+        telemetry_gnss.pvtUpdated = 0U;
+    }
+    uint32_t now = HAL_GetTick();
+    if ((int32_t)(now - telemetry_gps_next_poll_ms) >= 0)
+    {
+        /* Persistent command buffer; UART ISR transmits it without blocking. */
+        if (HAL_UART_Transmit_IT(&huart2, nav_pvt_poll, sizeof(nav_pvt_poll)) == HAL_OK)
+            telemetry_gps_next_poll_ms = now + 1000U;
+    }
+}
+
+static void Telemetry_Start(void)
+{
+    /* Deselect every SPI device using its actual port before sensor traffic. */
+    HAL_GPIO_WritePin(BMI_CSG_GPIO_Port, BMI_CSG_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(BMI_CSA_GPIO_Port, BMI_CSA_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(BMP581_CS_GPIO_Port, BMP581_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(BMP585_CS_GPIO_Port, BMP585_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GNSS_NRST_GPIO_Port, GNSS_NRST_Pin, GPIO_PIN_SET);
+    memset(&flight_data, 0, sizeof(flight_data));
+    Telemetry_Status("Boot: initializing LSM6DSO...\r\n");
+    if (LSM6DSO_App_Init() != LSM6DSO_OK)
+    {
+        Telemetry_Status("Logging not started: LSM6DSO init failed\r\n");
+        return;
+    }
+    /* Temporary barometer input is exactly 1000 Pa at init and each update. */
+    flight_data.bmp585_pressure = 1000.0f;
+    // BMP5_App_Init(); /* Hardware barometer remains disabled. */
+    Autocode_Init();
+    telemetry_sampling = 1U;
+    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    telemetry_lockout_latched = 0U;
+    telemetry_has_previous_packet = 0U;
+    UBX_Init(&telemetry_gnss, &huart2);
+    telemetry_gps_next_poll_ms = HAL_GetTick();
+    if (retSD != 0U)
+    {
+        Telemetry_Status("Logging not started: SD driver link failed\r\n");
+        return;
+    }
+    Telemetry_Status("Boot: mounting SD card...\r\n");
+    FRESULT result = f_mount(&SDFatFS, SDPath, 1U);
+    if (result != FR_OK)
+    {
+        Telemetry_StopOnError("mount", result);
+        return;
+    }
+    /* Preserve previous flights; keep the original name for the first log. */
+    for (uint32_t file_number = 0U; file_number <= 999999U; ++file_number)
+    {
+        if (file_number == 0U)
+            (void)snprintf(telemetry_filename, sizeof(telemetry_filename), "flight.bin");
+        else
+            (void)snprintf(telemetry_filename, sizeof(telemetry_filename),
+                           "FL%06lu.BIN", (unsigned long)file_number);
+        result = f_open(&SDFile, telemetry_filename, FA_WRITE | FA_CREATE_NEW);
+        if (result != FR_EXIST) break;
+    }
+    if (result != FR_OK)
+    {
+        Telemetry_StopOnError("open", result);
+        return;
+    }
+    Telemetry_Status("Boot: writing log header...\r\n");
+    UINT header_written = 0U;
+    uint16_t header_size = FlightLog_BuildHeader(telemetry_header);
+    if (header_size == 0U)
+    {
+        Telemetry_StopOnError("header format", FR_INVALID_PARAMETER);
+        return;
+    }
+    result = f_write(&SDFile, telemetry_header, header_size, &header_written);
+    if (result != FR_OK || header_written != header_size)
+    {
+        Telemetry_StopOnError("header write", result);
+        return;
+    }
+    telemetry_packet_counter = 0U;
+    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    telemetry_last_sync_ms = HAL_GetTick();
+    telemetry_started = 0U;
+    telemetry_logging = 1U;
+}
+
+
+#if ENABLE_UART_TELEMETRY_PACKETS
+static void Telemetry_SendNavigationPacket(void)
+{
+    UartTelemetry_Encode(Autocode_GetNavigation(), telemetry_packet_counter,
+                         flight_data.timestamp_us_delta, telemetry_uart_candidate);
+    if (!telemetry_uart_status_pending && huart3.gState == HAL_UART_STATE_READY)
+    {
+        memcpy(telemetry_uart_packet_tx, telemetry_uart_candidate, UART_TELEMETRY_PACKET_SIZE);
+        if (HAL_UART_Transmit_IT(&huart3, telemetry_uart_packet_tx, UART_TELEMETRY_PACKET_SIZE) != HAL_OK)
+            telemetry_uart_dropped_packets++;
+    }
+    else telemetry_uart_dropped_packets++;
+    /* COM4 is USB CDC, not physical USART3. Mirror the identical frame there. */
+    USBD_CDC_HandleTypeDef *cdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (CDC_IsPortOpen_FS() && !telemetry_usb_status_pending &&
+        (int32_t)(HAL_GetTick() - telemetry_usb_ready_after_ms) >= 0 &&
+        hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED && cdc != NULL && cdc->TxState == 0U)
+    {
+        memcpy(telemetry_usb_packet_tx, telemetry_uart_candidate, UART_TELEMETRY_PACKET_SIZE);
+        if (CDC_Transmit_FS(telemetry_usb_packet_tx, UART_TELEMETRY_PACKET_SIZE) != USBD_OK)
+            telemetry_usb_dropped_packets++;
+    }
+    else telemetry_usb_dropped_packets++;
+}
+#endif
+
+static void Telemetry_CheckLockout(void)
+{
+    uint32_t now = HAL_GetTick();
+    if (!telemetry_lockout_latched && Autocode_GetNavigation()->flightMode_enum == LOCKOUT)
+    {
+        telemetry_lockout_latched = 1U;
+        telemetry_lockout_start_ms = now;
+    }
+    if (telemetry_logging && telemetry_lockout_latched &&
+        (uint32_t)(now - telemetry_lockout_start_ms) >= TELEMETRY_LOCKOUT_TAIL_MS)
+    {
+        telemetry_logging = 0U; /* No more SD or UART telemetry packets this boot. */
+        FRESULT sync_result = f_sync(&SDFile);
+        FRESULT close_result = f_close(&SDFile);
+        if (sync_result == FR_OK && close_result == FR_OK)
+            Telemetry_Status("Logging stopped: 120 seconds after LOCKOUT\r\n");
+        else
+        {
+            char message[128];
+            (void)snprintf(message, sizeof(message), "Logging stop failed: sync=%u close=%u\r\n",
+                           (unsigned)sync_result, (unsigned)close_result);
+            Telemetry_Status(message);
+        }
+    }
+}
+
+static void Telemetry_LogCurrentSample(uint32_t sample_us)
+{
+    flight_data.timestamp_us_delta = telemetry_has_previous_packet ?
+        (uint32_t)(sample_us - telemetry_previous_packet_us) : 0U;
+    flight_data.packet_counter = telemetry_packet_counter;
+    UINT bytes_written = 0U;
+    memcpy(&telemetry_record.base, &flight_data, sizeof(flight_data));
+    memcpy(&telemetry_record.navBus, Autocode_GetNavigation(), sizeof(navigation_bus));
+    memcpy(&telemetry_record.controllerBus, Autocode_GetController(), sizeof(controller_bus));
+    telemetry_record.gps_age_ms = telemetry_gps_received ?
+        (uint32_t)(HAL_GetTick() - telemetry_gps_last_ms) : UINT32_MAX;
+    telemetry_record.gps_valid = telemetry_gps_received && telemetry_gps_fix_valid &&
+                                  telemetry_record.gps_age_ms <= 2000U;
+    uint16_t packet_size = FlightLog_EncodePacket(&telemetry_record, telemetry_packet);
+    FRESULT result = f_write(&SDFile, telemetry_packet, packet_size, &bytes_written);
+    if (result != FR_OK || bytes_written != packet_size)
+    {
+        Telemetry_StopOnError("write/short write", result);
+        return;
+    }
+    telemetry_previous_packet_us = sample_us;
+    telemetry_has_previous_packet = 1U;
+#if ENABLE_UART_TELEMETRY_PACKETS
+    Telemetry_SendNavigationPacket();
+#endif
+    telemetry_packet_counter++;
+    /* Commit the first packet before declaring success, then once per second. */
+    if (!telemetry_started || (uint32_t)(HAL_GetTick() - telemetry_last_sync_ms) >= 1000U)
+    {
+        result = f_sync(&SDFile);
+        if (result != FR_OK)
+        {
+            Telemetry_StopOnError("sync", result);
+            return;
+        }
+        telemetry_last_sync_ms = HAL_GetTick();
+        if (!telemetry_started)
+        {
+            char message[128];
+            telemetry_started = 1U;
+            (void)snprintf(message, sizeof(message), "Logging started... %s\r\n", telemetry_filename);
+            Telemetry_Status(message);
+        }
+    }
+
+}
+
+static void Telemetry_Service(void)
+{
+    Telemetry_ServiceStatus();
+    Telemetry_ServiceGPS();
+    if (!telemetry_sampling) return;
+    uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
+    if ((int32_t)(now - telemetry_next_sample_us) < 0) return;
+    LSM6DSO_App_Process(&flight_data);
+    // BMP585_App_Process(&flight_data); /* Temporary constant instead. */
+    flight_data.bmp585_pressure = 1000.0f;
+    uint32_t sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    Autocode_Step(&flight_data);
+    Telemetry_CheckLockout();
+    if (telemetry_logging) Telemetry_LogCurrentSample(sample_us);
+    /* Model/GPS continue after logging stops. Skip catch-up bursts after SD latency. */
+    telemetry_next_sample_us += 10000U;
+    now = __HAL_TIM_GET_COUNTER(&htim5);
+    if ((int32_t)(now - telemetry_next_sample_us) >= 0)
+        telemetry_next_sample_us = now + 10000U;
+}
+
+#endif
+
 /* USER CODE END 0 */
 
 /**
@@ -920,7 +1282,11 @@ int main(void)
   /* Generated double-precision plant code needs M7 caches to meet 10 ms. USB
    * uses CPU-driven FIFO transfers (PCD DMA disabled), so no DMA cache alias. */
   SCB_EnableICache();
+#if ENABLE_SIMULATION_UART_LOG
   SCB_EnableDCache();
+#endif
+  /* Base telemetry uses SDMMC IDMA with the existing uncached FatFs buffers.
+   * Keep D-cache off in that mode to avoid stale SD data/cache-line damage. */
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
@@ -968,21 +1334,34 @@ Error_Handler();
 
   /* USER CODE END SysInit */
 
-  /* UART simulation needs no sensor, USB, SD, CAN or CM4 initialization. */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
   MX_TIM5_Init();
+#if !ENABLE_SIMULATION_UART_LOG
+  MX_SPI1_Init();
+  MX_USART2_UART_Init();
+  MX_SDMMC1_SD_Init();
+  MX_FATFS_Init();
+#endif
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   if (HAL_TIM_Base_Start(&htim5) != HAL_OK) Error_Handler();
+#if ENABLE_SIMULATION_UART_LOG
   simulation_phase = SIM_READY;
   simulation_next_ready_ms = HAL_GetTick();
+#else
+  Telemetry_Start();
+#endif
   /* USER CODE END 2 */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+#if ENABLE_SIMULATION_UART_LOG
     Simulation_Service();
     SimulationCom_Service();
+#else
+    Telemetry_Service();
+#endif
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }
@@ -1158,6 +1537,17 @@ static void MX_I2C1_Init(void)
 
 }
 
+
+/* Restore the original 4-bit SD interface; BSP_SD_Init is called by f_mount. */
+static void MX_SDMMC1_SD_Init(void)
+{
+  hsd1.Instance = SDMMC1;
+  hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+  hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
+  hsd1.Init.ClockDiv = 2;
+}
 
 /**
   * @brief SPI1 Initialization Function
@@ -1358,6 +1748,8 @@ static void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
+  HAL_NVIC_SetPriority(USART2_IRQn, 2U, 0U);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
 
   /* USER CODE END USART2_Init 2 */
 
@@ -1406,6 +1798,8 @@ static void MX_USART3_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART3_Init 2 */
+  HAL_NVIC_SetPriority(USART3_IRQn, 2U, 0U);
+  HAL_NVIC_EnableIRQ(USART3_IRQn);
 
   /* USER CODE END USART3_Init 2 */
 

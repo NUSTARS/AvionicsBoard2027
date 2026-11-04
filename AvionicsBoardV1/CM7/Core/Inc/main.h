@@ -102,7 +102,7 @@ typedef struct {
 typedef struct {
 
     // Timing
-    uint32_t timestamp_us;
+    uint32_t timestamp_us_delta; /* Interval since previous stored packet; first is zero. */
     uint32_t packet_counter;
 
     // BMI088

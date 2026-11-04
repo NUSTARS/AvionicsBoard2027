@@ -84,10 +84,10 @@ static int32_t Platform_SPI_Write(uint16_t Addr, uint16_t Reg, uint8_t *pData, u
 {
   uint8_t reg_8bit = (uint8_t)Reg;
   HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi1, &reg_8bit, 1, HAL_MAX_DELAY);
-  HAL_SPI_Transmit(&hspi1, pData, Length, HAL_MAX_DELAY);
+  HAL_StatusTypeDef status = HAL_SPI_Transmit(&hspi1, &reg_8bit, 1, 20U);
+  if (status == HAL_OK) status = HAL_SPI_Transmit(&hspi1, pData, Length, 20U);
   HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_SET);
-  return LSM6DSO_OK;
+  return status == HAL_OK ? LSM6DSO_OK : LSM6DSO_ERROR;
 }
 
 static int32_t Platform_SPI_Read(
@@ -106,9 +106,10 @@ static int32_t Platform_SPI_Read(
 
     HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_RESET);
 
-    HAL_SPI_TransmitReceive(&hspi1, tx, rx, Length + 1, HAL_MAX_DELAY);
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hspi1, tx, rx, Length + 1, 20U);
 
     HAL_GPIO_WritePin(LSM_CS_GPIO_Port, LSM_CS_Pin, GPIO_PIN_SET);
+    if (status != HAL_OK) return LSM6DSO_ERROR;
 
     for (uint16_t i = 0; i < Length; i++)
         pData[i] = rx[i + 1];

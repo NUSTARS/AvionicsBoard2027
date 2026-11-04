@@ -106,7 +106,16 @@ void UBX_RxByteCallback(UBX_HandleTypeDef *ubx, uint8_t incoming)
         if (ubx->ckA == ubx->rollingCkA && ubx->ckB == ubx->rollingCkB)
         {
             /* Valid packet - hand off to the main loop. */
-            ubx->packetAvailable = 1;
+            if (!ubx->packetAvailable) {
+                ubx->packetClass = ubx->rxClass;
+                ubx->packetId = ubx->rxId;
+                ubx->packetLen = ubx->rxLen;
+                memcpy(ubx->packetPayload, ubx->rxPayload, ubx->rxLen);
+                __DMB();
+                ubx->packetAvailable = 1;
+            } else {
+                ubx->droppedPackets++;
+            }
             ubx->rxPacketValidCount++;   /* DEBUG */
         }
         /* else: checksum mismatch, silently dropped - this is the check
@@ -138,15 +147,15 @@ void UBX_Update(UBX_HandleTypeDef *ubx)
  * into that struct. */
 static void UBX_ParsePacket(UBX_HandleTypeDef *ubx)
 {
-    switch (ubx->rxClass)
+    switch (ubx->packetClass)
     {
     case UBX_CLASS_NAV:
-        if (ubx->rxId == UBX_ID_NAV_PVT && ubx->rxLen == sizeof(UBX_NAV_PVT_t))
+        if (ubx->packetId == UBX_ID_NAV_PVT && ubx->packetLen == sizeof(UBX_NAV_PVT_t))
             UBX_ParseNavPvt(ubx);
         break;
 
     case UBX_CLASS_ACK:
-        UBX_ParseAck(ubx);
+        if (ubx->packetLen >= 2U) UBX_ParseAck(ubx);
         break;
 
     default:
@@ -156,15 +165,15 @@ static void UBX_ParsePacket(UBX_HandleTypeDef *ubx)
 
 static void UBX_ParseNavPvt(UBX_HandleTypeDef *ubx)
 {
-    memcpy(&ubx->pvt, ubx->rxPayload, sizeof(UBX_NAV_PVT_t));
+    memcpy(&ubx->pvt, ubx->packetPayload, sizeof(UBX_NAV_PVT_t));
     ubx->pvtUpdated = 1;
 }
 
 static void UBX_ParseAck(UBX_HandleTypeDef *ubx)
 {
-    ubx->ackClass = ubx->rxPayload[0];
-    ubx->ackId    = ubx->rxPayload[1];
-    ubx->ackResult = (ubx->rxId == UBX_ID_ACK_ACK) ? 1 : 0;
+    ubx->ackClass = ubx->packetPayload[0];
+    ubx->ackId    = ubx->packetPayload[1];
+    ubx->ackResult = (ubx->packetId == UBX_ID_ACK_ACK) ? 1 : 0;
 }
 
 void UBX_SendPacket(UBX_HandleTypeDef *ubx, uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)

@@ -112,6 +112,10 @@ typedef struct {
 
     /* set by the ISR, consumed by UBX_Update() in the main loop */
     volatile uint8_t packetAvailable;
+    uint8_t packetClass, packetId;
+    uint16_t packetLen;
+    uint8_t packetPayload[UBX_MAX_PAYLOAD_LEN];
+    volatile uint32_t droppedPackets;
 
     /* DEBUG: counts every byte the ISR receives, valid packet or not.
      * If this stays at 0, nothing is arriving on the wire at all - a

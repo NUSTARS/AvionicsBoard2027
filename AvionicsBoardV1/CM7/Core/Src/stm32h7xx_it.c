@@ -58,6 +58,8 @@
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
 extern SD_HandleTypeDef hsd1;
 /* USER CODE BEGIN EV */
+extern UART_HandleTypeDef huart2;
+extern UART_HandleTypeDef huart3;
 
 /* USER CODE END EV */
 
@@ -301,5 +303,14 @@ void OTG_FS_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+void USART2_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart2);
+}
+
+void USART3_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart3);
+}
 
 /* USER CODE END 1 */
