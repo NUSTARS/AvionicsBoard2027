@@ -76,7 +76,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim5;
 
 UART_HandleTypeDef huart2;
-UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 uint8_t usbTxBuf[USBBUF_MAXLEN];
@@ -84,6 +84,12 @@ uint16_t usbTxBufLen;
 // -----------------------------------
 // GNSS
 // -----------------------------------
+#define GNSS_DMA_BUF_SIZE 1024
+static uint8_t  gnss_dma_buf[GNSS_DMA_BUF_SIZE] __attribute__((aligned(32)));
+static uint16_t gnss_dma_tail = 0;
+volatile uint32_t gnss_uart_errs = 0;
+volatile uint32_t gnss_frames_ok = 0;
+
 uint8_t gnss_rx[256];
 uint8_t nav_rx[NAV_PVT_SIZE];
 
@@ -169,19 +175,26 @@ UINT bytes_read;
 uint32_t packet_counter = 0;
 
 const char *flight_filename = "flight.bin";
+
+uint32_t logging_start_time = 0;
+uint8_t logging_timer_started = 0;
+
+#define LOGGING_DURATION_MS 120000
+
+uint8_t stop_logging = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_USART3_UART_Init(void);
 static void MX_TIM5_Init(void);
 /* USER CODE BEGIN PFP */
 static void ubx_checksum(uint8_t *msg, uint16_t len,
@@ -236,11 +249,36 @@ void GNSS_PrintRaw(uint32_t timeout_ms)
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
     }
 }
-
-void ParseNAVPVT(void)
+void ParseNAVPVT(FlightData_t *flight_data)
 {
-    memcpy(&iTOW,          &ubx_payload[0],  4);
-    memcpy(&year,          &ubx_payload[4],  2);
+    // Raw GNSS values
+    uint32_t iTOW;
+    uint16_t year;
+
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t second;
+
+    uint8_t fixType;
+    uint8_t numSV;
+
+    int32_t longitude_raw;
+    int32_t latitude_raw;
+    int32_t height_raw;
+    int32_t heightMSL_raw;
+
+    int32_t velN_raw;
+    int32_t velE_raw;
+    int32_t velD_raw;
+    int32_t groundSpeed_raw;
+
+    // Timing
+    memcpy(&iTOW, &ubx_payload[0], 4);
+
+    // Date and time
+    memcpy(&year, &ubx_payload[4], 2);
 
     month  = ubx_payload[6];
     day    = ubx_payload[7];
@@ -248,137 +286,264 @@ void ParseNAVPVT(void)
     minute = ubx_payload[9];
     second = ubx_payload[10];
 
+    // GNSS status
     fixType = ubx_payload[20];
     numSV   = ubx_payload[23];
 
-    memcpy(&longitude_raw,   &ubx_payload[24], 4);
-    memcpy(&latitude_raw,    &ubx_payload[28], 4);
-    memcpy(&height_raw,      &ubx_payload[32], 4);
-    memcpy(&heightMSL_raw,   &ubx_payload[36], 4);
-    memcpy(&velN_raw,        &ubx_payload[48], 4);
-    memcpy(&velE_raw,        &ubx_payload[52], 4);
-    memcpy(&velD_raw,        &ubx_payload[56], 4);
+    // Position
+    memcpy(&longitude_raw, &ubx_payload[24], 4);
+    memcpy(&latitude_raw,  &ubx_payload[28], 4);
+
+    memcpy(&height_raw,    &ubx_payload[32], 4);
+    memcpy(&heightMSL_raw, &ubx_payload[36], 4);
+
+    // Velocity
+    memcpy(&velN_raw,       &ubx_payload[48], 4);
+    memcpy(&velE_raw,       &ubx_payload[52], 4);
+    memcpy(&velD_raw,       &ubx_payload[56], 4);
     memcpy(&groundSpeed_raw, &ubx_payload[60], 4);
+
+
+    // =========================================
+    // WRITE GNSS DATA INTO FLIGHT DATA STRUCT
+    // =========================================
+
+    // Position: UBX units are 1e-7 degrees
+    flight_data->latitude =
+        latitude_raw / 10000000.0;
+
+    flight_data->longitude =
+        longitude_raw / 10000000.0;
+
+    // Altitude: UBX units are mm
+    flight_data->altitude =
+        heightMSL_raw / 1000.0f;
+
+    // Velocity: UBX units are mm/s
+    flight_data->velocity_north =
+        velN_raw / 1000.0f;
+
+    flight_data->velocity_east =
+        velE_raw / 1000.0f;
+
+    flight_data->velocity_down =
+        velD_raw / 1000.0f;
+
+    // GNSS status
+    flight_data->gnss_fix_type = fixType;
+
+    flight_data->gnss_satellites = numSV;
+
+
+    // =========================================
+    // USB DEBUG OUTPUT
+    // =========================================
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
                            "\r\n===== NAV-PVT =====\r\n");
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
                            "Time: %04u-%02u-%02u %02u:%02u:%02u\r\n",
                            year, month, day, hour, minute, second);
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-                           "Fix Type: %u\r\nSatellites: %u\r\n",
+                           "Fix Type: %u\r\n"
+                           "Satellites: %u\r\n",
                            fixType, numSV);
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
                            "Latitude:  %.7f deg\r\n"
                            "Longitude: %.7f deg\r\n",
-                           latitude_raw / 10000000.0,
-                           longitude_raw / 10000000.0);
+                           flight_data->latitude,
+                           flight_data->longitude);
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
                            "Altitude: %.3f m\r\n"
                            "MSL Alt: %.3f m\r\n",
-                           height_raw / 1000.0,
-                           heightMSL_raw / 1000.0);
+                           height_raw / 1000.0f,
+                           flight_data->altitude);
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
 
     usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
                            "Vel N: %.3f m/s\r\n"
                            "Vel E: %.3f m/s\r\n"
                            "Vel D: %.3f m/s\r\n"
-                           "Ground Speed: %.3f m/s\r\n"
                            "===================\r\n",
-                           velN_raw / 1000.0,
-                           velE_raw / 1000.0,
-                           velD_raw / 1000.0,
-                           groundSpeed_raw / 1000.0);
+                           flight_data->velocity_north,
+                           flight_data->velocity_east,
+                           flight_data->velocity_down);
 
     if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+    {
         CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+    }
+}
+//void ParseNAVPVT(void)
+//{
+//    memcpy(&iTOW,          &ubx_payload[0],  4);
+//    memcpy(&year,          &ubx_payload[4],  2);
+//
+//    month  = ubx_payload[6];
+//    day    = ubx_payload[7];
+//    hour   = ubx_payload[8];
+//    minute = ubx_payload[9];
+//    second = ubx_payload[10];
+//
+//    fixType = ubx_payload[20];
+//    numSV   = ubx_payload[23];
+//
+//    memcpy(&longitude_raw,   &ubx_payload[24], 4);
+//    memcpy(&latitude_raw,    &ubx_payload[28], 4);
+//    memcpy(&height_raw,      &ubx_payload[32], 4);
+//    memcpy(&heightMSL_raw,   &ubx_payload[36], 4);
+//    memcpy(&velN_raw,        &ubx_payload[48], 4);
+//    memcpy(&velE_raw,        &ubx_payload[52], 4);
+//    memcpy(&velD_raw,        &ubx_payload[56], 4);
+//    memcpy(&groundSpeed_raw, &ubx_payload[60], 4);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "\r\n===== NAV-PVT =====\r\n");
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "Time: %04u-%02u-%02u %02u:%02u:%02u\r\n",
+//                           year, month, day, hour, minute, second);
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "Fix Type: %u\r\nSatellites: %u\r\n",
+//                           fixType, numSV);
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "Latitude:  %.7f deg\r\n"
+//                           "Longitude: %.7f deg\r\n",
+//                           latitude_raw / 10000000.0,
+//                           longitude_raw / 10000000.0);
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "Altitude: %.3f m\r\n"
+//                           "MSL Alt: %.3f m\r\n",
+//                           height_raw / 1000.0,
+//                           heightMSL_raw / 1000.0);
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//
+//    usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+//                           "Vel N: %.3f m/s\r\n"
+//                           "Vel E: %.3f m/s\r\n"
+//                           "Vel D: %.3f m/s\r\n"
+//                           "Ground Speed: %.3f m/s\r\n"
+//                           "===================\r\n",
+//                           velN_raw / 1000.0,
+//                           velE_raw / 1000.0,
+//                           velD_raw / 1000.0,
+//                           groundSpeed_raw / 1000.0);
+//
+//    if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+//        CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+//}
+
+typedef enum { S_SYNC1, S_SYNC2, S_CLASS, S_ID, S_LEN1, S_LEN2, S_PAYLOAD, S_CKA, S_CKB } ubx_state_t;
+static ubx_state_t ubx_state = S_SYNC1;
+static uint16_t    ubx_idx;
+
+static inline void ubx_ck(uint8_t b) { ubx_ck_a += b; ubx_ck_b += ubx_ck_a; }
+
+/* Feed one byte; returns 1 when a checksum-valid frame is complete
+   (result in ubx_class / ubx_id / ubx_length / ubx_payload). */
+static uint8_t ubx_feed(uint8_t b)
+{
+    switch (ubx_state)
+    {
+    case S_SYNC1: if (b == 0xB5) ubx_state = S_SYNC2; break;
+    case S_SYNC2:
+        if (b == 0x62) { ubx_ck_a = ubx_ck_b = 0; ubx_state = S_CLASS; }
+        else if (b != 0xB5) ubx_state = S_SYNC1;
+        break;
+    case S_CLASS: ubx_class = b;  ubx_ck(b); ubx_state = S_ID;   break;
+    case S_ID:    ubx_id = b;     ubx_ck(b); ubx_state = S_LEN1; break;
+    case S_LEN1:  ubx_length = b; ubx_ck(b); ubx_state = S_LEN2; break;
+    case S_LEN2:
+        ubx_length |= (uint16_t)b << 8; ubx_ck(b);
+        ubx_idx = 0;
+        if (ubx_length > UBX_MAX_PAYLOAD) ubx_state = S_SYNC1;   /* too big, drop */
+        else ubx_state = (ubx_length == 0) ? S_CKA : S_PAYLOAD;
+        break;
+    case S_PAYLOAD:
+        ubx_payload[ubx_idx++] = b; ubx_ck(b);
+        if (ubx_idx >= ubx_length) ubx_state = S_CKA;
+        break;
+    case S_CKA: ubx_state = (b == ubx_ck_a) ? S_CKB : S_SYNC1; break;
+    case S_CKB: ubx_state = S_SYNC1; return (b == ubx_ck_b);
+    }
+    return 0;
 }
 
-HAL_StatusTypeDef GNSS_PollNAVPVT(void)
+HAL_StatusTypeDef GNSS_DMA_Start(void)
 {
-    uint8_t rx[100];
+    gnss_dma_tail = 0;
+    return HAL_UART_Receive_DMA(&huart2, gnss_dma_buf, GNSS_DMA_BUF_SIZE);
+}
 
-    // 1. Clear pending bytes from the UART receive buffer
-    uint8_t dummy;
-    while (HAL_UART_Receive(&huart2, &dummy, 1, 2) == HAL_OK)
+/* Call every main-loop pass. Never blocks. */
+void GNSS_Service(void)
+{
+    /* Clear UART error flags so an overrun/framing error can't stall reception */
+    if (huart2.Instance->ISR & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE))
     {
+        gnss_uart_errs++;
+        huart2.Instance->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
     }
 
-    // 2. Send UBX-NAV-PVT poll
-    if (HAL_UART_Transmit(&huart2,
-                          (uint8_t *)nav_pvt_poll,
-                          sizeof(nav_pvt_poll),
-                          100) != HAL_OK)
+    /* DMA write position = buffer size - bytes still to transfer */
+    uint16_t head = GNSS_DMA_BUF_SIZE - __HAL_DMA_GET_COUNTER(huart2.hdmarx);
+    if (head >= GNSS_DMA_BUF_SIZE) head = 0;
+
+    while (gnss_dma_tail != head)
     {
-        return HAL_ERROR;
+        if (ubx_feed(gnss_dma_buf[gnss_dma_tail]) &&
+            ubx_class == 0x01 && ubx_id == 0x07 && ubx_length == 92)
+        {
+            gnss_frames_ok++;
+            ParseNAVPVT(&flight_data);
+        }
+        if (++gnss_dma_tail >= GNSS_DMA_BUF_SIZE) gnss_dma_tail = 0;
     }
-
-    // 3. Read response
-    if (HAL_UART_Receive(&huart2,
-                         rx,
-                         sizeof(rx),
-                         3000) != HAL_OK)
-    {
-        return HAL_TIMEOUT;
-    }
-
-    // 4. Validate UBX header
-    if (rx[0] != 0xB5 || rx[1] != 0x62)
-    {
-        return HAL_ERROR;
-    }
-
-    // 5. Validate message class and ID
-    if (rx[2] != 0x01 || rx[3] != 0x07)
-    {
-        return HAL_ERROR;
-    }
-
-    // 6. Validate payload length (92 bytes)
-    if (rx[4] != 0x5C || rx[5] != 0x00)
-    {
-        return HAL_ERROR;
-    }
-
-    // 7. Verify UBX checksum over class through payload
-    uint8_t ck_a = 0;
-    uint8_t ck_b = 0;
-
-    for (int i = 2; i < 98; i++)
-    {
-        ck_a += rx[i];
-        ck_b += ck_a;
-    }
-
-    if (rx[98] != ck_a || rx[99] != ck_b)
-    {
-        return HAL_ERROR;
-    }
-
-    // 8. Copy complete message and payload
-    memcpy(nav_rx, rx, sizeof(rx));
-    memcpy(ubx_payload, &rx[6], 92);
-
-    return HAL_OK;
 }
 
 /* USER CODE END PFP */
@@ -409,14 +574,6 @@ uint16_t usbTxBufLen = 0;
 uint16_t usbRxBufLen = 0;
 
 uint8_t  usbRxFlag 	 = 0;
-
-void USB_RXCallback(uint8_t* Buf, uint32_t *Len) {
-
-	memcpy(usbRxBuf, Buf, *Len);
-	usbRxBufLen = *Len;
-	usbRxFlag = 1;
-
-}
 
 /* USER CODE END 0 */
 
@@ -487,13 +644,13 @@ Error_Handler();
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_FDCAN2_Init();
   MX_I2C1_Init();
   MX_SDMMC1_SD_Init();
   MX_SPI1_Init();
   MX_TIM2_Init();
   MX_USART2_UART_Init();
-  MX_USART3_UART_Init();
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
   MX_TIM5_Init();
@@ -516,69 +673,46 @@ Error_Handler();
   HAL_GPIO_WritePin(GNSS_NRST_GPIO_Port, GNSS_NRST_Pin, GPIO_PIN_SET);
 
 
-//  FRESULT fres;
-//
-//
-//  fres = f_mount(&SDFatFS, SDPath, 1);
-//
-//  if (fres != FR_OK)
-//  {
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                             "SD f_mount failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                             "SD mounted successfully\r\n");
-//  }
-//
-//  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//  {
-//      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//  }
-//
-//  fres = f_open(&SDFile,
-//                "flight.bin",
-//                FA_WRITE | FA_CREATE_ALWAYS);
-//
-//  if (fres != FR_OK)
-//  {
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                             "SD f_open failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//                             "Flight file opened successfully\r\n");
-//  }
-//
-//  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//  {
-//      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//  }
+  FRESULT fres;
 
 
-//  if (fres != FR_OK)
-//  {
-//      printf("SD f_mount failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      printf("SD mounted successfully\r\n");
-//  }
-//
-//  fres = f_open(&SDFile,
-//                "flight.bin",
-//                FA_WRITE | FA_CREATE_ALWAYS);
-//
-//  if (fres != FR_OK)
-//  {
-//      printf("SD f_open failed: %d\r\n", fres);
-//  }
-//  else
-//  {
-//      printf("Flight file opened successfully\r\n");
-//  }
+  fres = f_mount(&SDFatFS, SDPath, 1);
+
+  if (fres != FR_OK)
+  {
+      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+                             "SD f_mount failed: %d\r\n", fres);
+  }
+  else
+  {
+      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+                             "SD mounted successfully\r\n");
+  }
+
+  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+  {
+      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+  }
+
+  fres = f_open(&SDFile,
+                "flight.bin",
+                FA_WRITE | FA_CREATE_ALWAYS);
+
+  if (fres != FR_OK)
+  {
+      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+                             "SD f_open failed: %d\r\n", fres);
+  }
+  else
+  {
+      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+                             "Flight file opened successfully\r\n");
+  }
+
+  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+  {
+      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+  }
 
   if (LSM6DSO_App_Init() != LSM6DSO_OK)
   {
@@ -635,6 +769,12 @@ Error_Handler();
 
   GNSS_PrintRaw(3000);
 
+  if (GNSS_DMA_Start() != HAL_OK) Error_Handler();
+
+  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+                         "GNSS DMA buf @ 0x%08lX\r\n", (unsigned long)gnss_dma_buf);
+  CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+
   Autocode_Init();
 
   /* USER CODE END 2 */
@@ -665,6 +805,13 @@ Error_Handler();
 
           case LOCKOUT:
               modeStr = "LOCKOUT";
+
+              if (logging_timer_started == 0)
+              {
+            	  logging_start_time = HAL_GetTick();
+            	  logging_timer_started = 1;
+              }
+
               break;
 
           default:
@@ -686,145 +833,119 @@ Error_Handler();
     	  CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
       }
 
+	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+	      "ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
+	      "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
+	      flight_data.lsm_accel.x,
+	      flight_data.lsm_accel.y,
+	      flight_data.lsm_accel.z,
+	      flight_data.lsm_gyro.x,
+	      flight_data.lsm_gyro.y,
+	      flight_data.lsm_gyro.z);
 
-//      LSM6DSO_App_Process(&flight_data);
-
-//	  printf("ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
-//			  "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
-//			  flight_data.lsm_accel.x,
-//			  flight_data.lsm_accel.y,
-//			  flight_data.lsm_accel.z,
-//			  flight_data.lsm_gyro.x,
-//			  flight_data.lsm_gyro.y,
-//			  flight_data.lsm_gyro.z);
-
-//	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	      "ACC: X=%.3f Y=%.3f Z=%.3f m/s^2 | "
-//	      "GYRO: X=%.3f Y=%.3f Z=%.3f deg/s\r\n",
-//	      flight_data.lsm_accel.x,
-//	      flight_data.lsm_accel.y,
-//	      flight_data.lsm_accel.z,
-//	      flight_data.lsm_gyro.x,
-//	      flight_data.lsm_gyro.y,
-//	      flight_data.lsm_gyro.z);
+	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+	  {
+	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+	  }
 //
-//	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	  {
-//	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//	  }
-
 //	  BMP585_App_Process(&flight_data);
 //
 //	  float altitude = 44330.0f *
 //	                   (1.0f - powf(flight_data.bmp585_pressure / 101325.0f, 0.1903f));
 //
 //	  float altitude_ft = altitude * 3.28084f;
-
+//
 //	  printf("PRESSURE: %.2f hPa | TEMP: %.2f C | ALT: %.2f ft\r\n",
 //	         flight_data.bmp585_pressure / 100.0f,
 //	         flight_data.bmp585_temperature,
 //			 altitude_ft);
 
-
-//	  flight_data.timestamp_us = __HAL_TIM_GET_COUNTER(&htim5);
-//	  flight_data.packet_counter = packet_counter++;
-//	  bytes_written = 0;
-//
-//	  fres = f_write(&SDFile,
-//			  &flight_data,
-//			  sizeof(FlightData_t),
-//			  &bytes_written);
-//
-//	  if (fres != FR_OK || bytes_written != sizeof(FlightData_t))
-//	  {
-//	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	                             "SD write failed: %d, wrote %u bytes\r\n",
-//	                             fres,
-//	                             (unsigned)bytes_written);
-//
-//	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//	  }
-//
-//	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	                         "sizeof FlightData_t = %u, bytes_written = %u\r\n",
-//	                         (unsigned)sizeof(FlightData_t),
-//	                         (unsigned)bytes_written);
-//
-//	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//
-//	  fres = f_sync(&SDFile);
-//
-//	  if (fres != FR_OK)
-//	  {
-//	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	                             "Sync failed: %d\r\n", fres);
-//
-//	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
-//	  }
-//
-//	  if (packet_counter >= 100)
-//	  {
-//	      f_close(&SDFile);
-//
-//	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
-//	                             "Logging finished.\r\n"
-//	                             "Expected file size: %lu\r\n"
-//	                             "packet_counter = %lu\r\n"
-//	                             "bytes_written = %u\r\n",
-//	                             (unsigned long)(packet_counter * sizeof(FlightData_t)),
-//	                             (unsigned long)packet_counter,
-//	                             (unsigned)bytes_written);
-//
-//	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
-//	      {
-//	    	  while (CDC_Transmit_FS(usbTxBuf, usbTxBufLen) == USBD_BUSY)
-//	    	  {
-//	    		  HAL_Delay(1);
-//	    	  }
-//	      }
-//	      while (1);
-//	  }
-
-//	  if (fres != FR_OK || bytes_written != sizeof(FlightData_t))
-//	  {
-//		  printf("SD write failed: %d, wrote %u bytes\r\n",
-//				  fres,
-//				  bytes_written);
-//	  }
-//
-//	  printf("sizeof FlightData_t = %u, bytes_written = %u\r\n",
-//	         (unsigned)sizeof(FlightData_t),
-//	         (unsigned)bytes_written);
-//
-//	  fres = f_sync(&SDFile);
-//
-//	  if (fres != FR_OK) {
-//		  printf("Sync failed: %d\r\n", fres);
-//	  }
-//
-//	  if (packet_counter >= 6000) {
-//		  f_close(&SDFile);
-//		  printf("Logging finished.\r\n");
-//		  printf("Expected file size: %lu\r\n",
-//		         (unsigned long)(packet_counter * sizeof(FlightData_t)));
-//		  printf("packet_counter = %lu\r\n",
-//		         (unsigned long)packet_counter);
-//
-//		  printf("bytes_written = %u\r\n",
-//		         (unsigned)bytes_written);
-//		  while (1);
-//	  }
-
-	  if (GNSS_PollNAVPVT() == HAL_OK)
+      // ------------------------
+      // LOCKOUT STOP LOGGING
+      // ------------------------
+	  if (logging_timer_started &&
+	      (HAL_GetTick() - logging_start_time >= LOGGING_DURATION_MS))
 	  {
-		  ParseNAVPVT();
+	      stop_logging = 1;
 	  }
 
+	  if (stop_logging == 1)
+	  	  {
+	  	      f_sync(&SDFile);
 
-//	  HAL_Delay(50);
+	  	      f_close(&SDFile);
+
+	  	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+	  	      	                             "Logging finished.\r\n"
+	  	      	                             "Expected file size: %lu\r\n"
+	  	      	                             "packet_counter = %lu\r\n"
+	  	      	                             "bytes_written = %u\r\n",
+	  	      	                             (unsigned long)(packet_counter * sizeof(FlightData_t)),
+	  	      	                             (unsigned long)packet_counter,
+	  	      	                             (unsigned)bytes_written);
+
+	  	      	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+	  	      	      {
+	  	      	    	  while (CDC_Transmit_FS(usbTxBuf, usbTxBufLen) == USBD_BUSY)
+	  	      	    	  {
+	  	      	    		  HAL_Delay(1);
+	  	      	    	  }
+	  	      	      }
+
+	  	      while (1);
+	  	  }
+
+	  // ------------------------
+	  // LOGGING
+	  // ------------------------
+	  flight_data.timestamp_us = __HAL_TIM_GET_COUNTER(&htim5);
+	  flight_data.packet_counter = packet_counter++;
+	  bytes_written = 0;
+
+	  fres = f_write(&SDFile,
+			  &flight_data,
+			  sizeof(FlightData_t),
+			  &bytes_written);
+
+	  if (fres != FR_OK || bytes_written != sizeof(FlightData_t))
+	  {
+	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+	                             "SD write failed: %d, wrote %u bytes\r\n",
+	                             fres,
+	                             (unsigned)bytes_written);
+
+	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+	  }
+
+	  usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+	                         "sizeof FlightData_t = %u, bytes_written = %u\r\n",
+	                         (unsigned)sizeof(FlightData_t),
+	                         (unsigned)bytes_written);
+
+	  if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+	      CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+
+	  fres = f_sync(&SDFile);
+
+	  if (fres != FR_OK)
+	  {
+	      usbTxBufLen = snprintf((char *)usbTxBuf, USBBUF_MAXLEN,
+	                             "Sync failed: %d\r\n", fres);
+
+	      if (usbTxBufLen > 0 && usbTxBufLen < USBBUF_MAXLEN)
+	          CDC_Transmit_FS(usbTxBuf, usbTxBufLen);
+	  }
+
+	  static uint32_t last_poll_ms = 0;
+	  GNSS_Service();
+	  if ((HAL_GetTick() - last_poll_ms) >= 1000)
+	  {
+		  last_poll_ms = HAL_GetTick();
+		  HAL_UART_Transmit(&huart2, nav_pvt_poll, sizeof(nav_pvt_poll), 100);
+	  }
+
+	  HAL_Delay(50);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -1154,7 +1275,7 @@ static void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 59;
+  htim5.Init.Prescaler = 95;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 4294967295;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -1229,50 +1350,18 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
+  * Enable DMA controller clock
   */
-static void MX_USART3_UART_Init(void)
+static void MX_DMA_Init(void)
 {
 
-  /* USER CODE BEGIN USART3_Init 0 */
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
 
@@ -1291,8 +1380,8 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
 
