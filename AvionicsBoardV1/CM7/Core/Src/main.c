@@ -1212,6 +1212,9 @@ static void Telemetry_LogCurrentSample(uint32_t sample_us)
     telemetry_record.gps_valid = telemetry_gps_received && telemetry_gps_fix_valid &&
                                   telemetry_record.gps_age_ms <= 2000U;
     telemetry_record.gnssFixOK = telemetry_gps_received && telemetry_gps_fix_valid;
+    /* The averaging buffer caps each count at UINT16_MAX. */
+    telemetry_record.lsm_accel_samples = (uint16_t)lsm_last_accel_samples;
+    telemetry_record.lsm_gyro_samples = (uint16_t)lsm_last_gyro_samples;
     uint16_t packet_size = FlightLog_EncodePacket(&telemetry_record, telemetry_packet);
     FRESULT result = f_write(&SDFile, telemetry_packet, packet_size, &bytes_written);
     if (result != FR_OK || bytes_written != packet_size)

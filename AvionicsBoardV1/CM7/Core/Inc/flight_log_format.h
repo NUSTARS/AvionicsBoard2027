@@ -7,7 +7,7 @@
 #include <string.h>
 #define FLIGHT_LOG_PREFIX_SIZE 20U
 #define FLIGHT_LOG_DESCRIPTOR_SIZE 28U
-#define FLIGHT_LOG_FIELD_COUNT 65U
+#define FLIGHT_LOG_FIELD_COUNT 67U
 #define FLIGHT_LOG_HEADER_SIZE (20U + 28U * FLIGHT_LOG_FIELD_COUNT + 4U)
 /* Preserve generated bus layout/padding; descriptors expose each actual field. */
 #pragma pack(push, 1)
@@ -18,6 +18,8 @@ typedef struct {
  uint8_t gps_valid;
  uint32_t gps_age_ms;
  uint8_t gnssFixOK; /* Raw latest NAV-PVT flags bit 0; check gps_valid for freshness. */
+ uint16_t lsm_accel_samples;
+ uint16_t lsm_gyro_samples;
 } FlightLogRecord_t;
 #pragma pack(pop)
 #define FLIGHT_LOG_PAYLOAD_SIZE ((uint16_t)sizeof(FlightLogRecord_t))
@@ -87,7 +89,9 @@ static const FlightLogField flight_log_fields[FLIGHT_LOG_FIELD_COUNT] = {
  {"ctl_control_deg",FLT_F64,4,(uint16_t)offsetof(FlightLogRecord_t,controllerBus.control_deg)},
  {"gps_valid",FLT_U8,1,(uint16_t)offsetof(FlightLogRecord_t,gps_valid)},
  {"gps_age_ms",FLT_U32,1,(uint16_t)offsetof(FlightLogRecord_t,gps_age_ms)},
- {"gnssFixOK",FLT_U8,1,(uint16_t)offsetof(FlightLogRecord_t,gnssFixOK)}
+ {"gnssFixOK",FLT_U8,1,(uint16_t)offsetof(FlightLogRecord_t,gnssFixOK)},
+ {"lsm_accel_samples",FLT_U16,1,(uint16_t)offsetof(FlightLogRecord_t,lsm_accel_samples)},
+ {"lsm_gyro_samples",FLT_U16,1,(uint16_t)offsetof(FlightLogRecord_t,lsm_gyro_samples)}
 };
 #undef FLT_FIELD
 static void FlightLog_Put16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }

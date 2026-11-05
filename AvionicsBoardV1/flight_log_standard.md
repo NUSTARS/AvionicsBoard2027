@@ -22,7 +22,7 @@ The logger syncs the first packet and then once per second. `Logging started... 
 
 `header | packet[0] | packet[1] | ...`
 
-Current header size is **1844 bytes** (65 descriptors). Current decoded payload size is **560 bytes**, and wire packet size is **643 bytes**. For N complete packets, file size is `1844 + 643*N`. The CSV contains 85 scalar columns. All integer metadata is unsigned little-endian. Payload IEEE-754 floats are little-endian.
+Current header size is **1900 bytes** (67 descriptors). Current decoded payload size is **564 bytes**, and wire packet size is **643 bytes**. For N complete packets, file size is `1900 + 643*N`. The CSV contains 87 scalar columns. All integer metadata is unsigned little-endian. Payload IEEE-754 floats are little-endian.
 
 ### Fixed header prefix: 20 bytes
 
@@ -35,10 +35,10 @@ Python layout: `<8sBBBBHHHH`.
 | 9 | 1 | Endian identifier = 1 (little-endian) |
 | 10 | 1 | Error-correction identifier = 1 (extended Hamming 72,64) |
 | 11 | 1 | Integrity flags = 1 (CRC-32 present) |
-| 12 | 2 | Total header bytes, including final CRC = 1844 |
-| 14 | 2 | Unencoded payload bytes = 560 |
+| 12 | 2 | Total header bytes, including final CRC = 1900 |
+| 14 | 2 | Unencoded payload bytes = 564 |
 | 16 | 2 | Complete wire packet bytes, including marker = 643 |
-| 18 | 2 | Number of field descriptors 65 |
+| 18 | 2 | Number of field descriptors 67 |
 
 The prefix is followed by `field_count` descriptors. Each is 28 bytes, Python `<24sBBH`: NUL-terminated ASCII name in 24 bytes, type ID (uint8), element count (uint8), byte offset into the decoded payload (uint16). Names must be unique after column expansion. Types cannot overlap or exceed payload bounds. The decoder reads the descriptor layout rather than assuming the current offsets below. Three-element fields expand to `_x`, `_y`, `_z`; other arrays use numeric suffixes.
 
@@ -83,6 +83,8 @@ The combined packed record is:
 | 554 | gps_valid (uint8) | 1 |
 | 555 | gps_age_ms (uint32) | 4 |
 | 559 | gnssFixOK (uint8, raw latest receiver fix flag) | 1 |
+| 560 | lsm_accel_samples (uint16) | 2 |
+| 562 | lsm_gyro_samples (uint16) | 2 |
 
 Generated bus members retain their ABI padding. Every semantic scalar/array member has its own descriptor with the actual byte offset; the decoder does not infer compiler padding. The ARM flight-mode enum uses uint8 storage, while another compiler can use int32; the descriptor selects the matching type. real_T values are float64 and boolean_T flags are uint8. Fields use these CSV aliases:
 
@@ -100,7 +102,7 @@ Navigation and controller values are captured immediately after the model step d
 
 Each packet consists of ASCII `PKT2` (4 bytes), followed by 71 consecutive 9-byte SECDED codewords. For a general payload length P, the number of codewords is `ceil((P+4)/8)` and wire size is `4+9*ceil((P+4)/8)`.
 
-The data before encoding is: 560-byte payload, its little-endian 4-byte CRC-32, then 4 zero padding bytes, totaling 568 bytes. CRC and padding are themselves covered by SECDED encoding. Payload CRC covers only the 560 decoded payload bytes, including timestamp and packet counter.
+The data before encoding is: 564-byte payload, its little-endian 4-byte CRC-32, with no padding, totaling 568 bytes. CRC and padding are themselves covered by SECDED encoding. Payload CRC covers only the 564 decoded payload bytes, including timestamp and packet counter.
 
 For every 8 input bytes, extended Hamming(72,64) produces 9 encoded bytes:
 
@@ -272,7 +274,6 @@ SPI errors disable acquisition rather than run a blocking abort/reinit in an IRQ
 Aligned, separate 32-byte DMA buffers live in DMA-accessible AXI SRAM; explicit
 cache maintenance covers configurations with the CM7 D-cache enabled.
 
-The existing full-scale settings and sensitivity calibration are preserved.
-In particular, this source currently uses 0.244 mg/LSB for its configured 4 g
-range; the LSM6DSO datasheet lists 0.122 mg/LSB for 4 g. This pre-existing factor
-must be checked against the actual fitted sensor/calibration independently.
+The accelerometer is configured for ±8 g with the datasheet sensitivity of
+0.244 mg/LSB. The SD sample count fields record the actual number of raw
+accelerometer and gyroscope samples used for each logged average.

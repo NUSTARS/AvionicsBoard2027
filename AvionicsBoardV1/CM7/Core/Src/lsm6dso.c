@@ -184,7 +184,7 @@ int32_t LSM6DSO_Init(LSM6DSO_Object_t *pObj)
   }
 
   /* Select default output data rate. */
-  pObj->acc_odr = LSM6DSO_XL_ODR_104Hz;
+  pObj->acc_odr = LSM6DSO_XL_ODR_1667Hz;
 
   /* Output data rate selection - power down. */
   if (lsm6dso_xl_data_rate_set(&(pObj->Ctx), LSM6DSO_XL_ODR_OFF) != LSM6DSO_OK)
@@ -193,13 +193,13 @@ int32_t LSM6DSO_Init(LSM6DSO_Object_t *pObj)
   }
 
   /* Full scale selection. */
-  if (lsm6dso_xl_full_scale_set(&(pObj->Ctx), LSM6DSO_4g) != LSM6DSO_OK)
+  if (lsm6dso_xl_full_scale_set(&(pObj->Ctx), LSM6DSO_8g) != LSM6DSO_OK)
   {
     return LSM6DSO_ERROR;
   }
 
   /* Select default output data rate. */
-  pObj->gyro_odr = LSM6DSO_GY_ODR_104Hz;
+  pObj->gyro_odr = LSM6DSO_GY_ODR_1667Hz;
 
   /* Output data rate selection - power down. */
   if (lsm6dso_gy_data_rate_set(&(pObj->Ctx), LSM6DSO_GY_ODR_OFF) != LSM6DSO_OK)
