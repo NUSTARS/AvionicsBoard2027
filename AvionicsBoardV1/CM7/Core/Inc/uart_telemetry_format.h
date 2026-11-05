@@ -2,9 +2,9 @@
 #define UART_TELEMETRY_FORMAT_H
 #include "flight_log_format.h"
 /* Fixed compact wire schema. All multibyte data are little-endian. */
-#define UART_TELEMETRY_VERSION 1U
-#define UART_TELEMETRY_DATA_SIZE 46U
-#define UART_TELEMETRY_BLOCKS 7U
+#define UART_TELEMETRY_VERSION 3U
+#define UART_TELEMETRY_DATA_SIZE 59U
+#define UART_TELEMETRY_BLOCKS 8U
 #define UART_TELEMETRY_PACKET_SIZE (4U + 9U * UART_TELEMETRY_BLOCKS)
 #pragma pack(push, 1)
 typedef struct {
@@ -15,12 +15,16 @@ typedef struct {
  float nav_phiEst_rad, nav_thetaEst_rad, nav_psiEst_rad;
  float nav_xVelEstNed_mps, nav_yVelEstNed_mps, nav_zVelEstNed_mps;
  float nav_xPosEst_m, nav_yPosEst_m, nav_zPosEst_m;
+ uint8_t gnssFixOK;
+ float gps_velocity_north_mps, gps_velocity_east_mps, gps_velocity_down_mps;
 } UartTelemetryPayload_t;
 #pragma pack(pop)
 _Static_assert(sizeof(UartTelemetryPayload_t)==UART_TELEMETRY_DATA_SIZE, "UART payload packing changed");
 _Static_assert(sizeof(float)==4U, "UART floats must be IEEE-754 binary32");
 static void UartTelemetry_Encode(const navigation_bus *nav, uint32_t sequence,
-                                  uint32_t delta_us, uint8_t out[UART_TELEMETRY_PACKET_SIZE])
+                                  uint32_t delta_us, uint8_t gnss_fix_ok,
+                                  const FlightData_t *gps,
+                                  uint8_t out[UART_TELEMETRY_PACKET_SIZE])
 {
  UartTelemetryPayload_t p;
  uint8_t data[UART_TELEMETRY_BLOCKS*8U];
@@ -37,9 +41,13 @@ static void UartTelemetry_Encode(const navigation_bus *nav, uint32_t sequence,
  p.nav_xPosEst_m=(float)nav->xPosEst_m;
  p.nav_yPosEst_m=(float)nav->yPosEst_m;
  p.nav_zPosEst_m=(float)nav->zPosEst_m;
+ p.gnssFixOK=gnss_fix_ok != 0U;
+ p.gps_velocity_north_mps=gps->velocity_north;
+ p.gps_velocity_east_mps=gps->velocity_east;
+ p.gps_velocity_down_mps=gps->velocity_down;
  memset(data,0,sizeof(data)); memcpy(data,&p,sizeof(p));
  FlightLog_Put32(data+sizeof(p),FlightLog_Crc32(data,sizeof(p)));
- memcpy(out,"NTL1",4U);
+ memcpy(out,"NTL3",4U);
  for(unsigned i=0;i<UART_TELEMETRY_BLOCKS;i++)
   FlightLog_EncodeWord(data+8U*i,out+4U+9U*i);
 }

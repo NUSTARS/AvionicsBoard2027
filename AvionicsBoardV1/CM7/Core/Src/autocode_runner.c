@@ -31,6 +31,12 @@ volatile uint32_t model_last_finish_us = 0;
 static uint32_t next_model_deadline_us = 0;
 static uint32_t previous_model_start_us = 0;
 static bool model_initialized = false;
+static bool model_gnss_fix_ok = false;
+
+void Autocode_SetGPSFix(uint8_t gnss_fix_ok)
+{
+    model_gnss_fix_ok = gnss_fix_ok != 0U;
+}
 
 
 /*
@@ -42,12 +48,20 @@ static void MapFlightDataToSensorBus(const FlightData_t *data, sensor_bus *bus)
     Vector3f_t accel __attribute__((aligned(8))) = data ? data->lsm_accel : (Vector3f_t){0};
     Vector3f_t gyro __attribute__((aligned(8))) = data ? data->lsm_gyro : (Vector3f_t){0};
     autocodeModel_initializeSensorBus(bus, &accel, &gyro, NULL, 1000.0);
+    bus->gpsFix_b = data != NULL && model_gnss_fix_ok;
+    bus->gpsLLA_na[0] = data ? data->latitude : 0.0;
+    bus->gpsLLA_na[1] = data ? data->longitude : 0.0;
+    bus->gpsLLA_na[2] = data ? data->altitude : 0.0;
+    bus->velNedMeas_mps[0] = data ? data->velocity_north : 0.0;
+    bus->velNedMeas_mps[1] = data ? data->velocity_east : 0.0;
+    bus->velNedMeas_mps[2] = data ? data->velocity_down : 0.0;
 }
 
 
 /* Initialize the generated Simulink model */
 void Autocode_Init(void)
 {
+    model_gnss_fix_ok = false;
     /* Zero the generated input and output structures */
     rtU_sensor_bus_e = (sensor_bus){0};
     navBus = (navigation_bus){0};

@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include "fatfs.h"
 #include "lsm6dso_app.h"
+#include "IMURunningBuffer.h"
 #include "bmp5_app.h"
 #include "autocode_runner.h"
 #include "GNSS.h"
@@ -1047,12 +1048,16 @@ static void Telemetry_ServiceGPS(void)
         flight_data.velocity_down = (float)pvt->velD * 0.001f;
         flight_data.gnss_fix_type = pvt->fixType;
         flight_data.gnss_satellites = pvt->numSV;
-        telemetry_gps_fix_valid = ((pvt->flags & 1U) != 0U && pvt->fixType >= 2U);
+        /* NAV-PVT flags bit 0 is the receiver's gnssFixOK indication. */
+        telemetry_gps_fix_valid = (pvt->flags & 1U) != 0U;
         telemetry_gps_received = 1U;
         telemetry_gps_last_ms = HAL_GetTick();
         telemetry_gnss.pvtUpdated = 0U;
     }
     uint32_t now = HAL_GetTick();
+    /* A missing/stale receiver must never leave the model's fix latched true. */
+    Autocode_SetGPSFix(telemetry_gps_received && telemetry_gps_fix_valid &&
+                      (uint32_t)(now - telemetry_gps_last_ms) <= 2000U);
     if ((int32_t)(now - telemetry_gps_next_poll_ms) >= 0)
     {
         /* Persistent command buffer; UART ISR transmits it without blocking. */
@@ -1082,7 +1087,7 @@ static void Telemetry_Start(void)
     // BMP5_App_Init(); /* Hardware barometer remains disabled. */
     Autocode_Init();
     telemetry_sampling = 1U;
-    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5) + 10000U;
     telemetry_lockout_latched = 0U;
     telemetry_has_previous_packet = 0U;
     UBX_Init(&telemetry_gnss, &huart2);
@@ -1130,7 +1135,9 @@ static void Telemetry_Start(void)
         return;
     }
     telemetry_packet_counter = 0U;
-    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    /* Exclude SD mount/header latency from the first 10 ms IMU average. */
+    IMURunningBuffer_Reset();
+    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5) + 10000U;
     telemetry_last_sync_ms = HAL_GetTick();
     telemetry_started = 0U;
     telemetry_logging = 1U;
@@ -1141,7 +1148,9 @@ static void Telemetry_Start(void)
 static void Telemetry_SendNavigationPacket(void)
 {
     UartTelemetry_Encode(Autocode_GetNavigation(), telemetry_packet_counter,
-                         flight_data.timestamp_us_delta, telemetry_uart_candidate);
+                         flight_data.timestamp_us_delta, telemetry_record.gnssFixOK,
+                         &flight_data,
+                         telemetry_uart_candidate);
     if (!telemetry_uart_status_pending && huart3.gState == HAL_UART_STATE_READY)
     {
         memcpy(telemetry_uart_packet_tx, telemetry_uart_candidate, UART_TELEMETRY_PACKET_SIZE);
@@ -1202,6 +1211,7 @@ static void Telemetry_LogCurrentSample(uint32_t sample_us)
         (uint32_t)(HAL_GetTick() - telemetry_gps_last_ms) : UINT32_MAX;
     telemetry_record.gps_valid = telemetry_gps_received && telemetry_gps_fix_valid &&
                                   telemetry_record.gps_age_ms <= 2000U;
+    telemetry_record.gnssFixOK = telemetry_gps_received && telemetry_gps_fix_valid;
     uint16_t packet_size = FlightLog_EncodePacket(&telemetry_record, telemetry_packet);
     FRESULT result = f_write(&SDFile, telemetry_packet, packet_size, &bytes_written);
     if (result != FR_OK || bytes_written != packet_size)
@@ -1240,10 +1250,18 @@ static void Telemetry_Service(void)
 {
     Telemetry_ServiceStatus();
     Telemetry_ServiceGPS();
+    /* The LOCKOUT tail deadline must still close the file if the IMU stops. */
+    Telemetry_CheckLockout();
     if (!telemetry_sampling) return;
     uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
     if ((int32_t)(now - telemetry_next_sample_us) < 0) return;
-    LSM6DSO_App_Process(&flight_data);
+    /* DMA/IRQs collect raw IMU samples even while FatFs is busy. Consume six
+     * running sums once per update; never wait or reuse an empty batch. */
+    if (!IMURunningBuffer_ReadAverage(&flight_data))
+    {
+        telemetry_next_sample_us = now + 10000U;
+        return;
+    }
     // BMP585_App_Process(&flight_data); /* Temporary constant instead. */
     flight_data.bmp585_pressure = 1000.0f;
     uint32_t sample_us = __HAL_TIM_GET_COUNTER(&htim5);

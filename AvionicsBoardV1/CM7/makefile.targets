@@ -19,3 +19,11 @@ AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: libautocodeModel_CM7.a
 # Recompile consumers whenever the generated model archive changes, including
 # copies whose preserved source timestamps predate existing firmware objects.
 Core/Src/main.o Core/Src/autocode_runner.o: libautocodeModel_CM7.a
+
+# A fresh IDE regeneration discovers this Core/Src file automatically. Include
+# it also when compiling with an existing generated source/object list.
+ifeq ($(filter %/IMURunningBuffer.o,$(OBJS)),)
+USER_OBJS += Core/Src/IMURunningBuffer.o
+endif
+AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: Core/Src/IMURunningBuffer.o
+-include Core/Src/IMURunningBuffer.d
