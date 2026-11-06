@@ -4,13 +4,15 @@ The CM7 logger records live LSM6DSO telemetry, GPS NAV-PVT telemetry, and the co
 
 The generated sensor bus has IMU, magnetometer and barometer fields, but no GPS input. GPS is logged independently alongside model outputs. Hardware barometer acquisition stays commented out; `baroMeas_Pa` is exactly **1000.0 Pa** both during initialization and every sensor-bus update. `bmp585_pressure` records that same placeholder. Unacquired BMI, BMP581, temperature and magnetometer values remain zero. LSM gyro degrees/s are converted to rad/s before entering the model.
 
-The first file is `flight.bin`; existing logs are preserved using `FL000001.BIN` and the next available number. Sampling is nominally 100 Hz, continuously. Every scheduled sample acquires the IMU, maps the current sensor input, and executes one model step. TIM5 drives sampling and model updates. While logging is active, the ISR queues each complete record in a 128-record RAM queue. The foreground encodes and writes records, and handles FatFs sync and close. If the queue is full, the producer drops the newest record and increments telemetry_queue_drops. Packet sequence gaps expose these losses; the actual interval between stored acquisitions is `timestamp_us_delta`; sum deltas with a wide/unbounded host integer to obtain elapsed time. Model step-duration/deadline counters remain debugger-visible. No PWM/actuator output is enabled.
+The first file is `FL000000.BIN`. Each boot uses the first available six-digit number, preserving existing logs. Sampling is nominally 100 Hz, continuously. Every scheduled sample acquires the IMU, maps the current sensor input, and executes one model step. TIM5 drives sampling and model updates. While logging is active, the ISR queues each complete record in a 128-record RAM queue. The foreground encodes and writes records, and handles FatFs sync and close. If the queue is full, the producer drops the newest record and increments telemetry_queue_drops. Packet sequence gaps expose these losses; the actual interval between stored acquisitions is `timestamp_us_delta`; sum deltas with a wide/unbounded host integer to obtain elapsed time. Model step-duration/deadline counters remain debugger-visible. No PWM/actuator output is enabled.
 
 GPS uses USART2 at 9600 baud, 8N1, a 1024-byte circular DMA receive buffer on DMA1 Stream 0, and an asynchronous NAV-PVT poll once per second. The TIM5 sample service drains the ring and checks UBX checksum and length. The DMA completion callback counts wraps so the reader can detect a full-ring overrun. The reader discards the backlog and resynchronizes after an overrun, and restarts DMA after HAL reports a receive error. Logging never waits for a satellite fix. Latitude/longitude are degrees, altitude is meters above the ellipsoid, and velocity N/E/D is m/s. `gnssFixOK` stores the latest receiver NAV-PVT flags bit 0 as 0/1 (zero before the first message). `gps_valid` requires gnssFixOK and a message no older than 2000 ms; this is the validity supplied to model input `gpsFix_b`. `gps_age_ms` is UINT32_MAX until the first NAV-PVT message; latest coordinates are retained even if the fix is subsequently invalid, so check validity/age.
 
 ## LOCKOUT logging tail and timestamp intervals
 
 The first sample with `nav_flightMode_enum == LOCKOUT` (3) latches HAL_GetTick. Logging continues until 120000 ms have elapsed from that observation, even if the mode later changes. The first scheduled service at or after the deadline stops adding records. The foreground drains the queue, syncs and closes the SD file, and reports `Logging stopped: 120 seconds after LOCKOUT`. The main loop, GPS receiver and model keep running. The tail timer is not reset by repeated LOCKOUT samples and unsigned subtraction handles HAL's millisecond tick rollover. The file close can lag the sampling cutoff while the foreground drains the queue and completes SD operations.
+
+Two AD8495 thermocouples are sampled on PA0 / ADC1_IN16 and PA1 / ADC1_IN17. The logger records the 16-bit ADC count and nominal temperature in Celsius using a 3.3 V ADC reference, 5 mV per degree C, and grounded amplifier REF. The sample service consumes the prior conversion and starts the next without waiting. Missing conversions are logged as NaN temperature.
 
 The first stored `timestamp_us_delta` is 0. Each subsequent value is `(uint32_t)(current_sample_timer_us - previous_written_sample_timer_us)`, normally about 10000. The internal 32-bit microsecond timer can roll over without causing a discontinuity in these short intervals. An interval of an entire 2^32 microseconds or longer cannot be represented uniquely; continuous 100 Hz operation does not approach that limit. The dynamic SD header names the field explicitly. Older headered logs with `timestamp_us` still describe an absolute timer and remain decodable; headerless legacy files retain their original timestamp_us interpretation.
 
@@ -22,7 +24,7 @@ The logger syncs the first packet and then once per second. `Logging started... 
 
 `header | packet[0] | packet[1] | ...`
 
-Current header size is **1900 bytes** (67 descriptors). Current decoded payload size is **564 bytes**, and wire packet size is **643 bytes**. For N complete packets, file size is `1900 + 643*N`. The CSV contains 87 scalar columns. All integer metadata is unsigned little-endian. Payload IEEE-754 floats are little-endian.
+Current header size is **2012 bytes** (71 descriptors). Current decoded payload size is **576 bytes**, and wire packet size is **661 bytes**. For N complete packets, file size is `2012 + 661*N`. The CSV contains 91 scalar columns. All integer metadata is unsigned little-endian. Payload IEEE-754 floats are little-endian.
 
 ### Fixed header prefix: 20 bytes
 
@@ -35,10 +37,10 @@ Python layout: `<8sBBBBHHHH`.
 | 9 | 1 | Endian identifier = 1 (little-endian) |
 | 10 | 1 | Error-correction identifier = 1 (extended Hamming 72,64) |
 | 11 | 1 | Integrity flags = 1 (CRC-32 present) |
-| 12 | 2 | Total header bytes, including final CRC = 1900 |
-| 14 | 2 | Unencoded payload bytes = 564 |
-| 16 | 2 | Complete wire packet bytes, including marker = 643 |
-| 18 | 2 | Number of field descriptors 67 |
+| 12 | 2 | Total header bytes, including final CRC = 2012 |
+| 14 | 2 | Unencoded payload bytes = 576 |
+| 16 | 2 | Complete wire packet bytes, including marker = 661 |
+| 18 | 2 | Number of field descriptors 71 |
 
 The prefix is followed by `field_count` descriptors. Each is 28 bytes, Python `<24sBBH`: NUL-terminated ASCII name in 24 bytes, type ID (uint8), element count (uint8), byte offset into the decoded payload (uint16). Names must be unique after column expansion. Types cannot overlap or exceed payload bounds. The decoder reads the descriptor layout rather than assuming the current offsets below. Three-element fields expand to `_x`, `_y`, `_z`; other arrays use numeric suffixes.
 
@@ -85,6 +87,10 @@ The combined packed record is:
 | 559 | gnssFixOK (uint8, raw latest receiver fix flag) | 1 |
 | 560 | lsm_accel_samples (uint16) | 2 |
 | 562 | lsm_gyro_samples (uint16) | 2 |
+| 564 | thermocouple_adc_raw (uint16) | 2 |
+| 566 | thermocouple_temp_c (float32) | 4 |
+| 570 | thermocouple2_adc_raw (uint16) | 2 |
+| 572 | thermocouple2_temp_c (float32) | 4 |
 
 Generated bus members retain their ABI padding. Every semantic scalar/array member has its own descriptor with the actual byte offset; the decoder does not infer compiler padding. The ARM flight-mode enum uses uint8 storage, while another compiler can use int32; the descriptor selects the matching type. real_T values are float64 and boolean_T flags are uint8. Fields use these CSV aliases:
 
@@ -102,7 +108,7 @@ Navigation and controller values are captured immediately after the model step d
 
 Each packet consists of ASCII `PKT2` (4 bytes), followed by 71 consecutive 9-byte SECDED codewords. For a general payload length P, the number of codewords is `ceil((P+4)/8)` and wire size is `4+9*ceil((P+4)/8)`.
 
-The data before encoding is: 564-byte payload, its little-endian 4-byte CRC-32, with no padding, totaling 568 bytes. CRC and padding are themselves covered by SECDED encoding. Payload CRC covers only the 564 decoded payload bytes, including timestamp and packet counter.
+The data before encoding is: 576-byte payload, its little-endian 4-byte CRC-32, followed by four zero padding bytes, totaling 584 bytes. CRC and padding are themselves covered by SECDED encoding. Payload CRC covers only the 576 decoded payload bytes, including timestamp and packet counter.
 
 For every 8 input bytes, extended Hamming(72,64) produces 9 encoded bytes:
 
@@ -121,9 +127,9 @@ CRC-32 is CRC-32/ISO-HDLC (the zlib.crc32 convention): reflected polynomial 0xED
 Updated installed script: `C:/Users/Christian/Documents/ActiveAero2027/activeControlSim/scripts/helpers/decodeFlightData.py`.
 
 ```powershell
-py C:\Users\Christian\Documents\ActiveAero2027\activeControlSim\scripts\helpers\decodeFlightData.py -i D:\flight.bin -o D:\flight.csv
+py C:\Users\Christian\Documents\ActiveAero2027\activeControlSim\scripts\helpers\decodeFlightData.py -i D:\FL000000.BIN -o D:\flight.csv
 # Positional arguments are also accepted:
-py C:\Users\Christian\Documents\ActiveAero2027\activeControlSim\scripts\helpers\decodeFlightData.py D:\flight.bin D:\flight.csv
+py C:\Users\Christian\Documents\ActiveAero2027\activeControlSim\scripts\helpers\decodeFlightData.py D:\FL000000.BIN D:\flight.csv
 ```
 
 With no input argument, the script prompts for input and output paths. With an input but no output argument, CSV defaults beside the input. `--force` permits replacing an existing CSV. Input and output cannot be the same path.

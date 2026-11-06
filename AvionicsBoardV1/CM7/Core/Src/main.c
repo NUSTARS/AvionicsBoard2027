@@ -29,6 +29,7 @@
 #include "fatfs.h"
 #include "lsm6dso_app.h"
 #include "IMURunningBuffer.h"
+#include "AD8495.h"
 #include "bmp5_app.h"
 #include "autocode_runner.h"
 #include "GNSS.h"
@@ -98,6 +99,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* Private variables ---------------------------------------------------------*/
 
+ADC_HandleTypeDef hadc1;
 FDCAN_HandleTypeDef hfdcan2;
 
 I2C_HandleTypeDef hi2c1;
@@ -242,6 +244,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
@@ -932,6 +935,7 @@ _Static_assert(sizeof(FlightData_t) == 154U, "Legacy flight.bin record size chan
 _Static_assert(offsetof(FlightData_t, lsm_accel) == 56U, "LSM field offset changed");
 _Static_assert(offsetof(FlightData_t, gnss_fix_type) == 152U, "GNSS field offset changed");
 static FlightData_t flight_data;
+static AD8495_Reading telemetry_thermocouples[AD8495_CHANNEL_COUNT];
 /* TIM5 produces records, the foreground owns FatFs and drains them.
  * Monotonic head/tail counters give all 128 slots to the queue. */
 #define TELEMETRY_QUEUE_CAPACITY 128U
@@ -1113,14 +1117,11 @@ static void Telemetry_Start(void)
         Telemetry_StopOnError("mount", result);
         return;
     }
-    /* Preserve previous flights; keep the original name for the first log. */
+    /* Preserve previous flights and start numbering at zero. */
     for (uint32_t file_number = 0U; file_number <= 999999U; ++file_number)
     {
-        if (file_number == 0U)
-            (void)snprintf(telemetry_filename, sizeof(telemetry_filename), "flight.bin");
-        else
-            (void)snprintf(telemetry_filename, sizeof(telemetry_filename),
-                           "FL%06lu.BIN", (unsigned long)file_number);
+        (void)snprintf(telemetry_filename, sizeof(telemetry_filename),
+                       "FL%06lu.BIN", (unsigned long)file_number);
         result = f_open(&SDFile, telemetry_filename, FA_WRITE | FA_CREATE_NEW);
         if (result != FR_EXIST) break;
     }
@@ -1221,6 +1222,10 @@ static void Telemetry_QueueCurrentSample(uint32_t sample_us)
     record->gnssFixOK = telemetry_gps_received && telemetry_gps_fix_valid;
     record->lsm_accel_samples = (uint16_t)lsm_last_accel_samples;
     record->lsm_gyro_samples = (uint16_t)lsm_last_gyro_samples;
+    record->thermocouple_adc_raw = telemetry_thermocouples[0].raw;
+    record->thermocouple_temp_c = telemetry_thermocouples[0].temp_c;
+    record->thermocouple2_adc_raw = telemetry_thermocouples[1].raw;
+    record->thermocouple2_temp_c = telemetry_thermocouples[1].temp_c;
     if (depth + 1U > telemetry_queue_high_water)
         telemetry_queue_high_water = depth + 1U;
     __DMB();
@@ -1262,6 +1267,11 @@ void TIM5_IRQHandler(void)
 
     Telemetry_ServiceGPS();
     Telemetry_CheckLockout();
+    if (AD8495_Read(telemetry_thermocouples) != HAL_OK)
+    {
+        for (unsigned channel = 0U; channel < AD8495_CHANNEL_COUNT; channel++)
+            telemetry_thermocouples[channel] = (AD8495_Reading){ .temp_c = NAN };
+    }
     if (!IMURunningBuffer_ReadAverage(&flight_data)) return;
 
     flight_data.bmp585_pressure = 1000.0f;
@@ -1421,6 +1431,7 @@ Error_Handler();
 #if !ENABLE_SIMULATION_UART_LOG
   MX_SPI1_Init();
   MX_USART2_UART_Init();
+  MX_ADC1_Init();
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
 #endif
@@ -1432,6 +1443,7 @@ Error_Handler();
   simulation_next_ready_ms = HAL_GetTick();
 #else
   Telemetry_Start();
+  (void)AD8495_Init(); /* A failed ADC start is recorded as NaN. */
   Telemetry_StartSampleTimer();
 #endif
   /* USER CODE END 2 */
@@ -1516,6 +1528,62 @@ void SystemClock_Config(void)
   /** Enables the Clock Security System
   */
   /* HSI: no external-clock security interrupt required. */
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_16B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DR;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
+  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.Oversampling.Ratio = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* AD8495_Init configures both channels in the injected sequencer. */
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -1717,14 +1785,6 @@ static void MX_TIM2_Init(void)
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();

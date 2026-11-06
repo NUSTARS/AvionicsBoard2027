@@ -27,3 +27,18 @@ USER_OBJS += Core/Src/IMURunningBuffer.o
 endif
 AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: Core/Src/IMURunningBuffer.o
 -include Core/Src/IMURunningBuffer.d
+
+# Allow CLI builds using source lists generated before the ADC was enabled.
+ADC_DRIVER_DIR := Drivers/STM32H7xx_HAL_Driver
+ADC_DRIVER_OBJS := $(addprefix $(ADC_DRIVER_DIR)/,stm32h7xx_hal_adc.o stm32h7xx_hal_adc_ex.o)
+ADC_FALLBACK_OBJS := $(filter-out $(patsubst ./%,%,$(OBJS)),$(ADC_DRIVER_OBJS))
+ifneq ($(ADC_FALLBACK_OBJS),)
+$(ADC_FALLBACK_OBJS): $(ADC_DRIVER_DIR)/%.o: ../../$(ADC_DRIVER_DIR)/Src/%.c
+	arm-none-eabi-gcc "$<" -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -std=gnu11 -g3 -DCORE_CM7 -DUSE_HAL_DRIVER -DSTM32H745xx -I../Core/Inc -I../../$(ADC_DRIVER_DIR)/Inc -I../../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I../../Drivers/CMSIS/Include -ffunction-sections -fdata-sections -MMD -MP -c -o "$@"
+USER_OBJS += $(ADC_FALLBACK_OBJS)
+endif
+ifeq ($(filter %/AD8495.o,$(OBJS)),)
+USER_OBJS += Core/Src/AD8495.o
+endif
+AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: Core/Src/AD8495.o $(ADC_DRIVER_OBJS)
+-include Core/Src/AD8495.d $(ADC_FALLBACK_OBJS:.o=.d)
