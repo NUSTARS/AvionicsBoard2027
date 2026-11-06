@@ -110,6 +110,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim5;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
@@ -240,6 +241,7 @@ static uint32_t simulation_log_rows_sent;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_FDCAN2_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
@@ -930,7 +932,17 @@ _Static_assert(sizeof(FlightData_t) == 154U, "Legacy flight.bin record size chan
 _Static_assert(offsetof(FlightData_t, lsm_accel) == 56U, "LSM field offset changed");
 _Static_assert(offsetof(FlightData_t, gnss_fix_type) == 152U, "GNSS field offset changed");
 static FlightData_t flight_data;
-static FlightLogRecord_t telemetry_record;
+/* TIM5 produces records, the foreground owns FatFs and drains them.
+ * Monotonic head/tail counters give all 128 slots to the queue. */
+#define TELEMETRY_QUEUE_CAPACITY 128U
+#define TELEMETRY_SAMPLE_PERIOD_US 10000U
+static FlightLogRecord_t telemetry_queue[TELEMETRY_QUEUE_CAPACITY];
+static volatile uint32_t telemetry_queue_head;
+static volatile uint32_t telemetry_queue_tail;
+volatile uint32_t telemetry_queue_drops;
+volatile uint32_t telemetry_queue_high_water;
+volatile uint32_t telemetry_missed_deadlines;
+static uint32_t telemetry_sample_sequence;
 static UBX_HandleTypeDef telemetry_gnss;
 static uint32_t telemetry_gps_last_ms;
 static uint32_t telemetry_gps_next_poll_ms;
@@ -941,7 +953,8 @@ static uint8_t telemetry_packet[FLIGHT_LOG_PACKET_SIZE];
 static uint32_t telemetry_packet_counter;
 static uint32_t telemetry_next_sample_us;
 static uint32_t telemetry_last_sync_ms;
-static uint8_t telemetry_logging;
+static volatile uint8_t telemetry_accepting;
+static uint8_t telemetry_logging; /* Foreground owns the open file. */
 static uint8_t telemetry_started;
 static uint8_t telemetry_sampling;
 static uint8_t telemetry_has_previous_packet;
@@ -1012,6 +1025,7 @@ static void Telemetry_ServiceStatus(void)
 static void Telemetry_StopOnError(const char *operation, FRESULT result)
 {
     char message[128];
+    telemetry_accepting = 0U;
     telemetry_logging = 0U;
     (void)f_close(&SDFile);
     (void)snprintf(message, sizeof(message), "SD %s failed: %u\r\n",
@@ -1019,21 +1033,17 @@ static void Telemetry_StopOnError(const char *operation, FRESULT result)
     Telemetry_Status(message);
 }
 
-/* GPS receives bytes independently of SD latency. A NAV-PVT mailbox remains
- * immutable until UBX_Update consumes it. Never wait for a satellite fix. */
+/* DMA callbacks track ring progress and errors. UBX parsing runs in the main loop. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *uart)
 {
-    if (uart->Instance == USART2)
-        UBX_RxByteCallback(&telemetry_gnss, telemetry_gnss.rxByte);
+    if (uart == &huart2) UBX_DMARxComplete(&telemetry_gnss);
 }
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *uart)
 {
-    if (uart->Instance == USART2)
-    {
-        __HAL_UART_CLEAR_OREFLAG(uart);
-        (void)HAL_UART_Receive_IT(uart, &telemetry_gnss.rxByte, 1U);
-    }
+    if (uart == &huart2) UBX_DMARxError(&telemetry_gnss);
 }
+
 static void Telemetry_ServiceGPS(void)
 {
     UBX_Update(&telemetry_gnss);
@@ -1087,7 +1097,6 @@ static void Telemetry_Start(void)
     // BMP5_App_Init(); /* Hardware barometer remains disabled. */
     Autocode_Init();
     telemetry_sampling = 1U;
-    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5) + 10000U;
     telemetry_lockout_latched = 0U;
     telemetry_has_previous_packet = 0U;
     UBX_Init(&telemetry_gnss, &huart2);
@@ -1135,21 +1144,21 @@ static void Telemetry_Start(void)
         return;
     }
     telemetry_packet_counter = 0U;
-    /* Exclude SD mount/header latency from the first 10 ms IMU average. */
-    IMURunningBuffer_Reset();
-    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5) + 10000U;
     telemetry_last_sync_ms = HAL_GetTick();
     telemetry_started = 0U;
     telemetry_logging = 1U;
+    telemetry_accepting = 1U;
 }
 
 
 #if ENABLE_UART_TELEMETRY_PACKETS
-static void Telemetry_SendNavigationPacket(void)
+static void Telemetry_SendNavigationPacket(const FlightLogRecord_t *record)
 {
-    UartTelemetry_Encode(Autocode_GetNavigation(), telemetry_packet_counter,
-                         flight_data.timestamp_us_delta, telemetry_record.gnssFixOK,
-                         &flight_data,
+    navigation_bus nav;
+    memcpy(&nav, &record->navBus, sizeof(nav));
+    UartTelemetry_Encode(&nav, record->base.packet_counter,
+                         record->base.timestamp_us_delta, record->gnssFixOK,
+                         &record->base,
                          telemetry_uart_candidate);
     if (!telemetry_uart_status_pending && huart3.gState == HAL_UART_STATE_READY)
     {
@@ -1180,42 +1189,120 @@ static void Telemetry_CheckLockout(void)
         telemetry_lockout_latched = 1U;
         telemetry_lockout_start_ms = now;
     }
-    if (telemetry_logging && telemetry_lockout_latched &&
+    if (telemetry_accepting && telemetry_lockout_latched &&
         (uint32_t)(now - telemetry_lockout_start_ms) >= TELEMETRY_LOCKOUT_TAIL_MS)
+        telemetry_accepting = 0U;
+}
+
+/* TIM5 is the sole producer. Publish only complete records. */
+static void Telemetry_QueueCurrentSample(uint32_t sample_us)
+{
+    uint32_t sequence = telemetry_sample_sequence++;
+    uint32_t head = telemetry_queue_head;
+    uint32_t depth = head - telemetry_queue_tail;
+    if (depth >= TELEMETRY_QUEUE_CAPACITY)
     {
-        telemetry_logging = 0U; /* No more SD or UART telemetry packets this boot. */
-        FRESULT sync_result = f_sync(&SDFile);
-        FRESULT close_result = f_close(&SDFile);
-        if (sync_result == FR_OK && close_result == FR_OK)
+        telemetry_queue_drops++;
+        return;
+    }
+
+    FlightLogRecord_t *record = &telemetry_queue[head % TELEMETRY_QUEUE_CAPACITY];
+    memcpy(&record->base, &flight_data, sizeof(flight_data));
+    /* Keep the absolute timestamp in RAM. The writer computes the delta
+     * against the last saved record, including time across a full queue. */
+    record->base.timestamp_us_delta = sample_us;
+    record->base.packet_counter = sequence;
+    memcpy(&record->navBus, Autocode_GetNavigation(), sizeof(navigation_bus));
+    memcpy(&record->controllerBus, Autocode_GetController(), sizeof(controller_bus));
+    record->gps_age_ms = telemetry_gps_received ?
+        (uint32_t)(HAL_GetTick() - telemetry_gps_last_ms) : UINT32_MAX;
+    record->gps_valid = telemetry_gps_received && telemetry_gps_fix_valid &&
+                        record->gps_age_ms <= 2000U;
+    record->gnssFixOK = telemetry_gps_received && telemetry_gps_fix_valid;
+    record->lsm_accel_samples = (uint16_t)lsm_last_accel_samples;
+    record->lsm_gyro_samples = (uint16_t)lsm_last_gyro_samples;
+    if (depth + 1U > telemetry_queue_high_water)
+        telemetry_queue_high_water = depth + 1U;
+    __DMB();
+    telemetry_queue_head = head + 1U;
+}
+
+static void Telemetry_StartSampleTimer(void)
+{
+    if (!telemetry_sampling) return;
+    /* Exclude sensor samples collected during SD mount and header writes. */
+    IMURunningBuffer_Reset();
+    telemetry_next_sample_us = __HAL_TIM_GET_COUNTER(&htim5) + TELEMETRY_SAMPLE_PERIOD_US;
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, telemetry_next_sample_us);
+    __HAL_TIM_CLEAR_FLAG(&htim5, TIM_FLAG_CC1);
+    HAL_NVIC_SetPriority(TIM5_IRQn, 3U, 0U);
+    HAL_NVIC_EnableIRQ(TIM5_IRQn);
+    __HAL_TIM_ENABLE_IT(&htim5, TIM_IT_CC1);
+}
+
+void TIM5_IRQHandler(void)
+{
+    if (!__HAL_TIM_GET_FLAG(&htim5, TIM_FLAG_CC1)) return;
+    __HAL_TIM_CLEAR_FLAG(&htim5, TIM_FLAG_CC1);
+    uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
+    uint32_t periods = (now - telemetry_next_sample_us) / TELEMETRY_SAMPLE_PERIOD_US + 1U;
+    uint32_t next = telemetry_next_sample_us + periods * TELEMETRY_SAMPLE_PERIOD_US;
+    /* Leave time to program the compare even when IRQ entry was delayed. */
+    if (next - now < 20U)
+    {
+        next += TELEMETRY_SAMPLE_PERIOD_US;
+        periods++;
+    }
+    telemetry_missed_deadlines += periods - 1U;
+    telemetry_next_sample_us = next;
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, next);
+    /* A higher-priority IRQ can delay the compare write past its deadline. */
+    if ((int32_t)(__HAL_TIM_GET_COUNTER(&htim5) - next) >= 0)
+        htim5.Instance->EGR = TIM_EGR_CC1G;
+
+    Telemetry_ServiceGPS();
+    Telemetry_CheckLockout();
+    if (!IMURunningBuffer_ReadAverage(&flight_data)) return;
+
+    flight_data.bmp585_pressure = 1000.0f;
+    uint32_t sample_us = __HAL_TIM_GET_COUNTER(&htim5);
+    Autocode_Step(&flight_data);
+    Telemetry_CheckLockout();
+    if (telemetry_accepting) Telemetry_QueueCurrentSample(sample_us);
+}
+
+/* Foreground is the sole SD owner, including periodic sync and close. */
+static void Telemetry_Service(void)
+{
+    Telemetry_ServiceStatus();
+    if (!telemetry_logging) return;
+
+    uint32_t tail = telemetry_queue_tail;
+    if (!telemetry_accepting && tail == telemetry_queue_head)
+    {
+        telemetry_logging = 0U;
+        FRESULT result = f_close(&SDFile); /* FatFs syncs before closing. */
+        if (result == FR_OK)
             Telemetry_Status("Logging stopped: 120 seconds after LOCKOUT\r\n");
         else
         {
             char message[128];
-            (void)snprintf(message, sizeof(message), "Logging stop failed: sync=%u close=%u\r\n",
-                           (unsigned)sync_result, (unsigned)close_result);
+            (void)snprintf(message, sizeof(message), "Logging stop failed: close=%u\r\n",
+                           (unsigned)result);
             Telemetry_Status(message);
         }
+        return;
     }
-}
+    if (tail == telemetry_queue_head) return;
+    __DMB();
 
-static void Telemetry_LogCurrentSample(uint32_t sample_us)
-{
-    flight_data.timestamp_us_delta = telemetry_has_previous_packet ?
-        (uint32_t)(sample_us - telemetry_previous_packet_us) : 0U;
-    flight_data.packet_counter = telemetry_packet_counter;
+    FlightLogRecord_t *record = &telemetry_queue[tail % TELEMETRY_QUEUE_CAPACITY];
+    uint32_t sample_us = record->base.timestamp_us_delta;
+    record->base.timestamp_us_delta = telemetry_has_previous_packet ?
+        sample_us - telemetry_previous_packet_us : 0U;
+
     UINT bytes_written = 0U;
-    memcpy(&telemetry_record.base, &flight_data, sizeof(flight_data));
-    memcpy(&telemetry_record.navBus, Autocode_GetNavigation(), sizeof(navigation_bus));
-    memcpy(&telemetry_record.controllerBus, Autocode_GetController(), sizeof(controller_bus));
-    telemetry_record.gps_age_ms = telemetry_gps_received ?
-        (uint32_t)(HAL_GetTick() - telemetry_gps_last_ms) : UINT32_MAX;
-    telemetry_record.gps_valid = telemetry_gps_received && telemetry_gps_fix_valid &&
-                                  telemetry_record.gps_age_ms <= 2000U;
-    telemetry_record.gnssFixOK = telemetry_gps_received && telemetry_gps_fix_valid;
-    /* The averaging buffer caps each count at UINT16_MAX. */
-    telemetry_record.lsm_accel_samples = (uint16_t)lsm_last_accel_samples;
-    telemetry_record.lsm_gyro_samples = (uint16_t)lsm_last_gyro_samples;
-    uint16_t packet_size = FlightLog_EncodePacket(&telemetry_record, telemetry_packet);
+    uint16_t packet_size = FlightLog_EncodePacket(record, telemetry_packet);
     FRESULT result = f_write(&SDFile, telemetry_packet, packet_size, &bytes_written);
     if (result != FR_OK || bytes_written != packet_size)
     {
@@ -1224,11 +1311,13 @@ static void Telemetry_LogCurrentSample(uint32_t sample_us)
     }
     telemetry_previous_packet_us = sample_us;
     telemetry_has_previous_packet = 1U;
-#if ENABLE_UART_TELEMETRY_PACKETS
-    Telemetry_SendNavigationPacket();
-#endif
     telemetry_packet_counter++;
-    /* Commit the first packet before declaring success, then once per second. */
+#if ENABLE_UART_TELEMETRY_PACKETS
+    Telemetry_SendNavigationPacket(record);
+#endif
+    __DMB();
+    telemetry_queue_tail = tail + 1U;
+
     if (!telemetry_started || (uint32_t)(HAL_GetTick() - telemetry_last_sync_ms) >= 1000U)
     {
         result = f_sync(&SDFile);
@@ -1246,36 +1335,6 @@ static void Telemetry_LogCurrentSample(uint32_t sample_us)
             Telemetry_Status(message);
         }
     }
-
-}
-
-static void Telemetry_Service(void)
-{
-    Telemetry_ServiceStatus();
-    Telemetry_ServiceGPS();
-    /* The LOCKOUT tail deadline must still close the file if the IMU stops. */
-    Telemetry_CheckLockout();
-    if (!telemetry_sampling) return;
-    uint32_t now = __HAL_TIM_GET_COUNTER(&htim5);
-    if ((int32_t)(now - telemetry_next_sample_us) < 0) return;
-    /* DMA/IRQs collect raw IMU samples even while FatFs is busy. Consume six
-     * running sums once per update; never wait or reuse an empty batch. */
-    if (!IMURunningBuffer_ReadAverage(&flight_data))
-    {
-        telemetry_next_sample_us = now + 10000U;
-        return;
-    }
-    // BMP585_App_Process(&flight_data); /* Temporary constant instead. */
-    flight_data.bmp585_pressure = 1000.0f;
-    uint32_t sample_us = __HAL_TIM_GET_COUNTER(&htim5);
-    Autocode_Step(&flight_data);
-    Telemetry_CheckLockout();
-    if (telemetry_logging) Telemetry_LogCurrentSample(sample_us);
-    /* Model/GPS continue after logging stops. Skip catch-up bursts after SD latency. */
-    telemetry_next_sample_us += 10000U;
-    now = __HAL_TIM_GET_COUNTER(&htim5);
-    if ((int32_t)(now - telemetry_next_sample_us) >= 0)
-        telemetry_next_sample_us = now + 10000U;
 }
 
 #endif
@@ -1356,6 +1415,7 @@ Error_Handler();
   /* USER CODE END SysInit */
 
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART3_UART_Init();
   MX_TIM5_Init();
 #if !ENABLE_SIMULATION_UART_LOG
@@ -1372,6 +1432,7 @@ Error_Handler();
   simulation_next_ready_ms = HAL_GetTick();
 #else
   Telemetry_Start();
+  Telemetry_StartSampleTimer();
 #endif
   /* USER CODE END 2 */
   /* USER CODE BEGIN WHILE */
@@ -1823,6 +1884,22 @@ static void MX_USART3_UART_Init(void)
   HAL_NVIC_EnableIRQ(USART3_IRQn);
 
   /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
 

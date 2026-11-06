@@ -12,17 +12,46 @@ static void UBX_ParseNavPvt(UBX_HandleTypeDef *ubx);
 static void UBX_ParseAck(UBX_HandleTypeDef *ubx);
 static void UBX_ChecksumUpdate(UBX_HandleTypeDef *ubx, uint8_t b);
 
+static void UBX_StartDMA(UBX_HandleTypeDef *ubx)
+{
+    UART_HandleTypeDef *uart = ubx->huart;
+    if (uart->hdmarx == NULL || uart->RxState != HAL_UART_STATE_READY ||
+        HAL_DMA_GetState(uart->hdmarx) != HAL_DMA_STATE_READY)
+        return;
+
+    ubx->rxState = UBX_STATE_SYNC1;
+    ubx->dmaWraps = 0U;
+    ubx->dmaConsumed = 0U;
+    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
+        SCB_InvalidateDCache_by_Addr((uint32_t *)ubx->dmaRx, UBX_DMA_RX_SIZE);
+    __HAL_UART_CLEAR_FLAG(uart, UART_CLEAR_OREF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_PEF);
+
+    ubx->dmaRunning = 1U;
+    if (HAL_UART_Receive_DMA(uart, ubx->dmaRx, UBX_DMA_RX_SIZE) != HAL_OK)
+    {
+        ubx->dmaRunning = 0U;
+        ubx->dmaErrors++;
+    }
+}
+
 void UBX_Init(UBX_HandleTypeDef *ubx, UART_HandleTypeDef *huart)
 {
-    memset(ubx, 0, sizeof(UBX_HandleTypeDef));
+    memset(ubx, 0, sizeof(*ubx));
     ubx->huart = huart;
-    ubx->rxState = UBX_STATE_SYNC1;
     ubx->ackResult = -1;
+    UBX_StartDMA(ubx);
+}
 
-    /* Continuous single-byte interrupt reception. HAL_UART_RxCpltCallback
-     * must call UBX_RxByteCallback() for this huart instance - see the
-     * glue code in the usage example. */
-    HAL_UART_Receive_IT(ubx->huart, &ubx->rxByte, 1);
+void UBX_DMARxComplete(UBX_HandleTypeDef *ubx)
+{
+    ubx->dmaWraps++;
+}
+
+void UBX_DMARxError(UBX_HandleTypeDef *ubx)
+{
+    /* HAL calls this after aborting the failed RX transfer. Restart in foreground. */
+    ubx->dmaRunning = 0U;
+    ubx->dmaErrors++;
 }
 
 static void UBX_ChecksumUpdate(UBX_HandleTypeDef *ubx, uint8_t b)
@@ -31,10 +60,7 @@ static void UBX_ChecksumUpdate(UBX_HandleTypeDef *ubx, uint8_t b)
     ubx->rollingCkB = (uint8_t)(ubx->rollingCkB + ubx->rollingCkA);
 }
 
-/* Call this from HAL_UART_RxCpltCallback() for the matching huart instance.
- * Kept deliberately light (no memcpy, no float math) since it runs in
- * interrupt context; actual field decoding happens later in UBX_Update(). */
-void UBX_RxByteCallback(UBX_HandleTypeDef *ubx, uint8_t incoming)
+static void UBX_FeedByte(UBX_HandleTypeDef *ubx, uint8_t incoming)
 {
     ubx->rxByteCount++;   /* DEBUG: counts every byte regardless of parse outcome */
 
@@ -105,18 +131,8 @@ void UBX_RxByteCallback(UBX_HandleTypeDef *ubx, uint8_t incoming)
         ubx->ckB = incoming;
         if (ubx->ckA == ubx->rollingCkA && ubx->ckB == ubx->rollingCkB)
         {
-            /* Valid packet - hand off to the main loop. */
-            if (!ubx->packetAvailable) {
-                ubx->packetClass = ubx->rxClass;
-                ubx->packetId = ubx->rxId;
-                ubx->packetLen = ubx->rxLen;
-                memcpy(ubx->packetPayload, ubx->rxPayload, ubx->rxLen);
-                __DMB();
-                ubx->packetAvailable = 1;
-            } else {
-                ubx->droppedPackets++;
-            }
-            ubx->rxPacketValidCount++;   /* DEBUG */
+            UBX_ParsePacket(ubx);
+            ubx->rxPacketValidCount++;
         }
         /* else: checksum mismatch, silently dropped - this is the check
          * SimpleMethod/STM32-GNSS does not do. */
@@ -128,17 +144,45 @@ void UBX_RxByteCallback(UBX_HandleTypeDef *ubx, uint8_t incoming)
         break;
     }
 
-    /* Re-arm for the next byte */
-    HAL_UART_Receive_IT(ubx->huart, &ubx->rxByte, 1);
 }
 
 void UBX_Update(UBX_HandleTypeDef *ubx)
 {
-    if (!ubx->packetAvailable)
+    if (ubx->huart == NULL) return;
+    if (!ubx->dmaRunning)
+    {
+        UBX_StartDMA(ubx);
+        return;
+    }
+
+    DMA_HandleTypeDef *dma = ubx->huart->hdmarx;
+    uint32_t wraps = ubx->dmaWraps;
+    uint32_t remaining = __HAL_DMA_GET_COUNTER(dma);
+    /* Defer if NDTR and the wrap count may describe different laps. */
+    if (remaining == 0U || __HAL_DMA_GET_FLAG(dma, __HAL_DMA_GET_TC_FLAG_INDEX(dma)) ||
+        wraps != ubx->dmaWraps || !ubx->dmaRunning)
         return;
 
-    UBX_ParsePacket(ubx);
-    ubx->packetAvailable = 0;
+    uint32_t produced = wraps * UBX_DMA_RX_SIZE + UBX_DMA_RX_SIZE - remaining;
+    uint32_t available = produced - ubx->dmaConsumed;
+    if (available >= UBX_DMA_RX_SIZE)
+    {
+        ubx->dmaOverruns++;
+        ubx->dmaConsumed = produced;
+        ubx->rxState = UBX_STATE_SYNC1;
+        return;
+    }
+    if (available == 0U) return;
+
+    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U)
+        SCB_InvalidateDCache_by_Addr((uint32_t *)ubx->dmaRx, UBX_DMA_RX_SIZE);
+    __DMB();
+    while (ubx->dmaConsumed != produced && ubx->dmaRunning)
+    {
+        uint32_t index = ubx->dmaConsumed % UBX_DMA_RX_SIZE;
+        UBX_FeedByte(ubx, ubx->dmaRx[index]);
+        ubx->dmaConsumed++;
+    }
 }
 
 /* Class/ID dispatch table. Add new message types here following the
@@ -147,15 +191,15 @@ void UBX_Update(UBX_HandleTypeDef *ubx)
  * into that struct. */
 static void UBX_ParsePacket(UBX_HandleTypeDef *ubx)
 {
-    switch (ubx->packetClass)
+    switch (ubx->rxClass)
     {
     case UBX_CLASS_NAV:
-        if (ubx->packetId == UBX_ID_NAV_PVT && ubx->packetLen == sizeof(UBX_NAV_PVT_t))
+        if (ubx->rxId == UBX_ID_NAV_PVT && ubx->rxLen == sizeof(UBX_NAV_PVT_t))
             UBX_ParseNavPvt(ubx);
         break;
 
     case UBX_CLASS_ACK:
-        if (ubx->packetLen >= 2U) UBX_ParseAck(ubx);
+        if (ubx->rxLen >= 2U) UBX_ParseAck(ubx);
         break;
 
     default:
@@ -165,15 +209,15 @@ static void UBX_ParsePacket(UBX_HandleTypeDef *ubx)
 
 static void UBX_ParseNavPvt(UBX_HandleTypeDef *ubx)
 {
-    memcpy(&ubx->pvt, ubx->packetPayload, sizeof(UBX_NAV_PVT_t));
+    memcpy(&ubx->pvt, ubx->rxPayload, sizeof(UBX_NAV_PVT_t));
     ubx->pvtUpdated = 1;
 }
 
 static void UBX_ParseAck(UBX_HandleTypeDef *ubx)
 {
-    ubx->ackClass = ubx->packetPayload[0];
-    ubx->ackId    = ubx->packetPayload[1];
-    ubx->ackResult = (ubx->packetId == UBX_ID_ACK_ACK) ? 1 : 0;
+    ubx->ackClass = ubx->rxPayload[0];
+    ubx->ackId    = ubx->rxPayload[1];
+    ubx->ackResult = (ubx->rxId == UBX_ID_ACK_ACK) ? 1 : 0;
 }
 
 void UBX_SendPacket(UBX_HandleTypeDef *ubx, uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)

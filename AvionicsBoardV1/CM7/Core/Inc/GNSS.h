@@ -43,6 +43,7 @@ extern "C" {
  * 4 Automotive, 5 Sea, 6/7/8 Airborne <1g/<2g/<4g, 9 Wrist, 10 Bike. */
 #define UBX_KEY_CFG_NAVSPG_DYNMODEL 0x20110021UL
 
+#define UBX_DMA_RX_SIZE 1024U
 #define UBX_MAX_PAYLOAD_LEN 128   /* NAV-PVT is 92 bytes; raise this if you add bigger messages */
 
 typedef enum {
@@ -99,9 +100,16 @@ typedef struct {
 typedef struct {
     UART_HandleTypeDef *huart;
 
-    /* byte-wise receive state machine, fed from the UART RX ISR */
+    /* Dedicated cache lines in DMA-accessible SRAM. Keep this handle out of DTCM. */
+    uint8_t dmaRx[UBX_DMA_RX_SIZE] __attribute__((aligned(32)));
+    volatile uint32_t dmaWraps;
+    uint32_t dmaConsumed;
+    volatile uint8_t dmaRunning;
+    volatile uint32_t dmaErrors;
+    uint32_t dmaOverruns;
+
+    /* Byte-wise state machine, fed by UBX_Update in the main loop. */
     UBX_RxState_t rxState;
-    uint8_t  rxByte;               /* landing zone for HAL_UART_Receive_IT */
     uint8_t  rxClass;
     uint8_t  rxId;
     uint16_t rxLen;
@@ -110,19 +118,7 @@ typedef struct {
     uint8_t  ckA, ckB;
     uint8_t  rollingCkA, rollingCkB;
 
-    /* set by the ISR, consumed by UBX_Update() in the main loop */
-    volatile uint8_t packetAvailable;
-    uint8_t packetClass, packetId;
-    uint16_t packetLen;
-    uint8_t packetPayload[UBX_MAX_PAYLOAD_LEN];
-    volatile uint32_t droppedPackets;
-
-    /* DEBUG: counts every byte the ISR receives, valid packet or not.
-     * If this stays at 0, nothing is arriving on the wire at all - a
-     * wiring/baud/power problem upstream of the parser. If it climbs but
-     * packetsValid stays at 0, bytes are arriving but never forming a
-     * checksum-valid UBX packet (wrong baud, swapped TX/RX, noise, or
-     * the module is in NMEA-only mode instead of outputting UBX). */
+    /* Debug counters for bytes consumed and checksum-valid packets. */
     volatile uint32_t rxByteCount;
     volatile uint32_t rxPacketValidCount;
 
@@ -138,7 +134,8 @@ typedef struct {
 } UBX_HandleTypeDef;
 
 void    UBX_Init(UBX_HandleTypeDef *ubx, UART_HandleTypeDef *huart);
-void    UBX_RxByteCallback(UBX_HandleTypeDef *ubx, uint8_t incoming);
+void    UBX_DMARxComplete(UBX_HandleTypeDef *ubx);
+void    UBX_DMARxError(UBX_HandleTypeDef *ubx);
 void    UBX_Update(UBX_HandleTypeDef *ubx);
 
 void    UBX_SendPacket(UBX_HandleTypeDef *ubx, uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len);
