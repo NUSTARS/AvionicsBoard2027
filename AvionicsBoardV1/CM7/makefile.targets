@@ -42,3 +42,9 @@ USER_OBJS += Core/Src/AD8495.o
 endif
 AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: Core/Src/AD8495.o $(ADC_DRIVER_OBJS)
 -include Core/Src/AD8495.d $(ADC_FALLBACK_OBJS:.o=.d)
+
+ifeq ($(filter %/jingle.o,$(OBJS)),)
+USER_OBJS += Core/Src/jingle.o
+endif
+AvionicsBoardV1_CM7.elf AvionicsBoardV1_CM7.map: Core/Src/jingle.o
+-include Core/Src/jingle.d

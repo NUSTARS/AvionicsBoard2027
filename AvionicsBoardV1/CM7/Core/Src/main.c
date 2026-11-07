@@ -29,6 +29,7 @@
 #include "fatfs.h"
 #include "lsm6dso_app.h"
 #include "IMURunningBuffer.h"
+#include "jingle.h"
 #include "AD8495.h"
 #include "bmp5_app.h"
 #include "autocode_runner.h"
@@ -1029,6 +1030,7 @@ static void Telemetry_ServiceStatus(void)
 static void Telemetry_StopOnError(const char *operation, FRESULT result)
 {
     char message[128];
+    Jingle_NotifySDResult(0U);
     telemetry_accepting = 0U;
     telemetry_logging = 0U;
     (void)f_close(&SDFile);
@@ -1070,8 +1072,10 @@ static void Telemetry_ServiceGPS(void)
     }
     uint32_t now = HAL_GetTick();
     /* A missing/stale receiver must never leave the model's fix latched true. */
-    Autocode_SetGPSFix(telemetry_gps_received && telemetry_gps_fix_valid &&
-                      (uint32_t)(now - telemetry_gps_last_ms) <= 2000U);
+    uint8_t locked = telemetry_gps_received && telemetry_gps_fix_valid &&
+                     (uint32_t)(now - telemetry_gps_last_ms) <= 2000U;
+    Autocode_SetGPSFix(locked);
+    Jingle_UpdateGPSLock(locked);
     if ((int32_t)(now - telemetry_gps_next_poll_ms) >= 0)
     {
         /* Persistent command buffer; UART ISR transmits it without blocking. */
@@ -1107,6 +1111,7 @@ static void Telemetry_Start(void)
     telemetry_gps_next_poll_ms = HAL_GetTick();
     if (retSD != 0U)
     {
+        Jingle_NotifySDResult(0U);
         Telemetry_Status("Logging not started: SD driver link failed\r\n");
         return;
     }
@@ -1296,6 +1301,7 @@ static void Telemetry_Service(void)
             Telemetry_Status("Logging stopped: 120 seconds after LOCKOUT\r\n");
         else
         {
+            Jingle_NotifySDResult(0U);
             char message[128];
             (void)snprintf(message, sizeof(message), "Logging stop failed: close=%u\r\n",
                            (unsigned)result);
@@ -1341,6 +1347,7 @@ static void Telemetry_Service(void)
         {
             char message[128];
             telemetry_started = 1U;
+            Jingle_NotifySDResult(1U);
             (void)snprintf(message, sizeof(message), "Logging started... %s\r\n", telemetry_filename);
             Telemetry_Status(message);
         }
@@ -1428,6 +1435,8 @@ Error_Handler();
   MX_DMA_Init();
   MX_USART3_UART_Init();
   MX_TIM5_Init();
+  MX_TIM2_Init();
+  Jingle_Init();
 #if !ENABLE_SIMULATION_UART_LOG
   MX_SPI1_Init();
   MX_USART2_UART_Init();
@@ -1450,6 +1459,7 @@ Error_Handler();
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    Jingle_Service();
 #if ENABLE_SIMULATION_UART_LOG
     Simulation_Service();
     SimulationCom_Service();
